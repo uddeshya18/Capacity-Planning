@@ -27,16 +27,11 @@ if st.sidebar.button("♻️ Reset All Data"):
 merc_file = st.sidebar.file_uploader("Upload Mercury Metrics (AHT)", type="csv")
 qc_file = st.sidebar.file_uploader("Upload Quality Central (Volume)", type="csv")
 
-# CRITICAL: This toggle now drives the entire Data Engine
+# CRITICAL TOGGLE
 hide_ghosts = st.sidebar.toggle("🚫 Hide Inactive (Ghost) Tasks", value=True)
 
 qas_per_site = st.sidebar.number_input("Current Team 2 Headcount", min_value=0.1, value=10.0)
 prod_hours = st.sidebar.slider("Daily Productive Hours", 5.0, 9.0, 7.5)
-
-def get_monday(d):
-    return d - timedelta(days=d.weekday())
-
-current_monday = get_monday(datetime.now())
 
 if merc_file and qc_file:
     # 1. LOAD & NORMALIZE
@@ -53,41 +48,41 @@ if merc_file and qc_file:
                                pd.to_numeric(df_m['Manual Skip Hours'], errors='coerce').fillna(0)) / \
                                pd.to_numeric(df_m['Processed Units'], errors='coerce').replace(0, np.nan)
 
-    # 3. DEFINE "ACTIVE" vs "GHOST"
+    # 3. IDENTIFY ACTIVE TASKS (Last 14 Days)
     all_weeks = sorted(df_q['Audit Creation Period Week'].unique(), reverse=True)
     recent_2_weeks = all_weeks[:2]
-    
-    # Get Workflows and Locales that actually had volume recently
     active_wf = df_q[df_q['Audit Creation Period Week'].isin(recent_2_weeks)]['workflow_name'].unique()
     active_loc = df_q[df_q['Audit Creation Period Week'].isin(recent_2_weeks)]['locale'].unique()
 
-    # 4. DATA PURGE (The Core Fix)
-    if hide_ghosts:
-        # If toggled, we pretend the ghost tasks don't exist in the files at all
-        df_q = df_q[df_q['workflow_name'].isin(active_wf) & df_q['locale'].isin(active_loc)]
-        df_m = df_m[df_m['Column-4:Transformation Type'].isin(active_wf) & df_m['Column-2:Locale'].isin(active_loc)]
-
-    # 5. SITE FILTERING
+    # 4. SITE FILTERING (CBG / en_US focused)
     all_sites = sorted(df_m['Column-1:Site'].unique())
     selected_sites = st.sidebar.multiselect("Filter Site:", all_sites, default=['CBG'] if 'CBG' in all_sites else all_sites)
+    
     f_m = df_m[df_m['Column-1:Site'].isin(selected_sites)]
     f_q = df_q[df_q['locale'].isin(f_m['Column-2:Locale'].unique())]
 
-    # 6. GROWTH & DEDUPLICATION (Now fully impacted by the Purge)
+    # 5. DEDUPLICATION
     batch_cols = ['execution_batch_id', 'workflow_name', 'locale', 'Audit Creation Period Week']
     df_q_dedup = f_q.groupby(batch_cols).agg({'audit_created_units': 'first', 'production_created_units': 'first'}).reset_index()
 
-    site_growth_val = 0.0
-    if not df_q_dedup.empty:
-        weekly_sum = df_q_dedup.groupby('Audit Creation Period Week')['audit_created_units'].sum().sort_index()
+    # 6. CALCULATE GROWTH (Before and After Filter to ensure logic holds)
+    def calc_growth(data):
+        if data.empty: return 0.0
+        weekly_sum = data.groupby('Audit Creation Period Week')['audit_created_units'].sum().sort_index()
         u = weekly_sum.values
-        if len(u) > 1:
-            diffs = [(u[i] - u[i-1]) / u[i-1] for i in range(1, len(u)) if u[i-1] > 0]
-            site_growth_val = np.mean(diffs) if diffs else 0.0
+        if len(u) < 2: return 0.0
+        diffs = [(u[i] - u[i-1]) / u[i-1] for i in range(1, len(u)) if u[i-1] > 0]
+        return np.mean(diffs)
 
-    st.sidebar.metric(label="📈 Purged Growth Rate", value=f"{site_growth_val * 100:.2f}%")
+    # If hidden, we purge data first so the GROWTH itself is based only on active tasks
+    if hide_ghosts:
+        df_q_dedup = df_q_dedup[df_q_dedup['workflow_name'].isin(active_wf) & df_q_dedup['locale'].isin(active_loc)]
+        f_m = f_m[f_m['Column-4:Transformation Type'].isin(active_wf) & f_m['Column-2:Locale'].isin(active_loc)]
 
-    # 7. AGGREGATION (Baseline: Last 4 Weeks)
+    site_growth_val = calc_growth(df_q_dedup)
+    st.sidebar.metric(label="📈 Current Growth Rate", value=f"{site_growth_val * 100:.2f}%")
+
+    # 7. BASELINE (Last 4 Weeks)
     num_weeks = 4
     recent_4_weeks = all_weeks[:4]
     qc_baseline = df_q_dedup[df_q_dedup['Audit Creation Period Week'].isin(recent_4_weeks)]
@@ -103,8 +98,8 @@ if merc_file and qc_file:
     tab1, tab2 = st.tabs(["📊 Historical Audit Data", "🚀 Future Forecast Explorer"])
 
     with tab1:
-        # LOCALES ON TOP
-        st.subheader("📍 Locale Average (Active Only)")
+        # LOCALES (TOP)
+        st.subheader("📍 Locale Average")
         loc_agg = qc_baseline.groupby('locale').agg({'audit_created_units':'sum', 'production_created_units':'sum'}).reset_index()
         loc_h = []
         for _, row in loc_agg.iterrows():
@@ -113,8 +108,8 @@ if merc_file and qc_file:
             loc_h.append({"Locale": row['locale'], "Avg Weekly Tasks": int(row['audit_created_units']/num_weeks), "Sampling %": f"{s_pct:.1f}%", "AHT (Secs)": f"{aht:.1f}"})
         st.dataframe(pd.DataFrame(loc_h), use_container_width=True, hide_index=True)
 
-        # WORKFLOWS ON BOTTOM
-        st.subheader("🛠️ Workflow Average (Active Only)")
+        # WORKFLOWS (BOTTOM)
+        st.subheader("🛠️ Workflow Average")
         wf_agg = qc_baseline.groupby('workflow_name').agg({'audit_created_units':'sum', 'production_created_units':'sum'}).reset_index()
         wf_h = []
         for _, row in wf_agg.iterrows():
@@ -125,22 +120,22 @@ if merc_file and qc_file:
 
     with tab2:
         st.subheader("Capacity Forecast Explorer")
-        week_options = [f"Week {i}" for i in range(1, 5)]
+        week_options = ["Week 1", "Week 2", "Week 3", "Week 4"]
         selected_week = st.selectbox("Select Prediction Week:", week_options)
         week_idx = week_options.index(selected_week) + 1
 
-        # LOCALES ON TOP
+        # LOCALES (TOP)
         st.markdown("#### 📍 Locale Forecast")
         loc_f = []
         for _, row in loc_agg.iterrows():
             aht = get_trimmed_aht(f_m[f_m['Column-2:Locale'] == row['locale']]['Calc_AHT'])
+            # Forecast logic: Baseline Avg * (1 + Growth)^weeks
             pred = (row['audit_created_units']/num_weeks) * (1 + (site_growth_val * week_idx))
             hc = (pred * aht) / (3600 * prod_hours * 5)
             loc_f.append({"Locale": row['locale'], "Expected Tasks": int(pred), "HC Needed": f"{hc:.2f}", "Staffing Gap": f"{qas_per_site - hc:.2f}"})
-        if loc_f:
-            st.dataframe(pd.DataFrame(loc_f).style.map(color_gap, subset=['Staffing Gap']), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(loc_f).style.map(color_gap, subset=['Staffing Gap']), use_container_width=True, hide_index=True)
 
-        # WORKFLOWS ON BOTTOM
+        # WORKFLOWS (BOTTOM)
         st.markdown("#### 🛠️ Workflow Forecast")
         wf_f = []
         for _, row in wf_agg.iterrows():
@@ -148,7 +143,6 @@ if merc_file and qc_file:
             pred = (row['audit_created_units']/num_weeks) * (1 + (site_growth_val * week_idx))
             hc = (pred * aht) / (3600 * prod_hours * 5)
             wf_f.append({"Workflow Name": row['workflow_name'], "Expected Tasks": int(pred), "HC Needed": f"{hc:.2f}", "Staffing Gap": f"{qas_per_site - hc:.2f}"})
-        if wf_f:
-            st.dataframe(pd.DataFrame(wf_f).style.map(color_gap, subset=['Staffing Gap']), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(wf_f).style.map(color_gap, subset=['Staffing Gap']), use_container_width=True, hide_index=True)
 else:
-    st.info("Upload files to start. Toggle 'Hide Inactive' to permanently remove non-current tasks from all math.")
+    st.info("Upload your Mercury and QC files. Toggle 'Hide Inactive' to strip out dead January volume and recalibrate your forecast.")
