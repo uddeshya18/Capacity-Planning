@@ -27,7 +27,7 @@ if st.sidebar.button("♻️ Reset All Data"):
 merc_file = st.sidebar.file_uploader("Upload Mercury Metrics (AHT)", type="csv")
 qc_file = st.sidebar.file_uploader("Upload Quality Central (Volume)", type="csv")
 
-# TOGGLE: Now only impacts visibility/inclusion, not the base growth math
+# CRITICAL: This toggle now drives the entire Data Engine
 hide_ghosts = st.sidebar.toggle("🚫 Hide Inactive (Ghost) Tasks", value=True)
 
 qas_per_site = st.sidebar.number_input("Current Team 2 Headcount", min_value=0.1, value=10.0)
@@ -53,14 +53,27 @@ if merc_file and qc_file:
                                pd.to_numeric(df_m['Manual Skip Hours'], errors='coerce').fillna(0)) / \
                                pd.to_numeric(df_m['Processed Units'], errors='coerce').replace(0, np.nan)
 
-    # 3. SITE FILTERING
+    # 3. DEFINE "ACTIVE" vs "GHOST"
+    all_weeks = sorted(df_q['Audit Creation Period Week'].unique(), reverse=True)
+    recent_2_weeks = all_weeks[:2]
+    
+    # Get Workflows and Locales that actually had volume recently
+    active_wf = df_q[df_q['Audit Creation Period Week'].isin(recent_2_weeks)]['workflow_name'].unique()
+    active_loc = df_q[df_q['Audit Creation Period Week'].isin(recent_2_weeks)]['locale'].unique()
+
+    # 4. DATA PURGE (The Core Fix)
+    if hide_ghosts:
+        # If toggled, we pretend the ghost tasks don't exist in the files at all
+        df_q = df_q[df_q['workflow_name'].isin(active_wf) & df_q['locale'].isin(active_loc)]
+        df_m = df_m[df_m['Column-4:Transformation Type'].isin(active_wf) & df_m['Column-2:Locale'].isin(active_loc)]
+
+    # 5. SITE FILTERING
     all_sites = sorted(df_m['Column-1:Site'].unique())
     selected_sites = st.sidebar.multiselect("Filter Site:", all_sites, default=['CBG'] if 'CBG' in all_sites else all_sites)
-    
     f_m = df_m[df_m['Column-1:Site'].isin(selected_sites)]
     f_q = df_q[df_q['locale'].isin(f_m['Column-2:Locale'].unique())]
 
-    # 4. STABLE GROWTH CALCULATION (Uses ALL filtered data regardless of toggle)
+    # 6. GROWTH & DEDUPLICATION (Now fully impacted by the Purge)
     batch_cols = ['execution_batch_id', 'workflow_name', 'locale', 'Audit Creation Period Week']
     df_q_dedup = f_q.groupby(batch_cols).agg({'audit_created_units': 'first', 'production_created_units': 'first'}).reset_index()
 
@@ -69,19 +82,12 @@ if merc_file and qc_file:
         weekly_sum = df_q_dedup.groupby('Audit Creation Period Week')['audit_created_units'].sum().sort_index()
         u = weekly_sum.values
         if len(u) > 1:
-            # We calculate growth on the full timeline to prevent "spike" when hiding tasks
             diffs = [(u[i] - u[i-1]) / u[i-1] for i in range(1, len(u)) if u[i-1] > 0]
             site_growth_val = np.mean(diffs) if diffs else 0.0
 
-    st.sidebar.metric(label="📈 Stable Growth Rate", value=f"{site_growth_val * 100:.2f}%")
+    st.sidebar.metric(label="📈 Purged Growth Rate", value=f"{site_growth_val * 100:.2f}%")
 
-    # 5. GHOST IDENTIFICATION (Last 2 weeks)
-    all_weeks = sorted(df_q['Audit Creation Period Week'].unique(), reverse=True)
-    recent_2_weeks = all_weeks[:2]
-    active_wf = df_q[df_q['Audit Creation Period Week'].isin(recent_2_weeks)]['workflow_name'].unique()
-    active_loc = df_q[df_q['Audit Creation Period Week'].isin(recent_2_weeks)]['locale'].unique()
-
-    # 6. AGGREGATION (Baseline: Last 4 Weeks)
+    # 7. AGGREGATION (Baseline: Last 4 Weeks)
     num_weeks = 4
     recent_4_weeks = all_weeks[:4]
     qc_baseline = df_q_dedup[df_q_dedup['Audit Creation Period Week'].isin(recent_4_weeks)]
@@ -97,14 +103,9 @@ if merc_file and qc_file:
     tab1, tab2 = st.tabs(["📊 Historical Audit Data", "🚀 Future Forecast Explorer"])
 
     with tab1:
-        st.subheader("Historical Weekly Averages")
-        
-        # TABLE 1: LOCALES
-        st.markdown("#### 📍 Locale Average")
+        # LOCALES ON TOP
+        st.subheader("📍 Locale Average (Active Only)")
         loc_agg = qc_baseline.groupby('locale').agg({'audit_created_units':'sum', 'production_created_units':'sum'}).reset_index()
-        if hide_ghosts:
-            loc_agg = loc_agg[loc_agg['locale'].isin(active_loc)]
-        
         loc_h = []
         for _, row in loc_agg.iterrows():
             aht = get_trimmed_aht(f_m[f_m['Column-2:Locale'] == row['locale']]['Calc_AHT'])
@@ -112,14 +113,9 @@ if merc_file and qc_file:
             loc_h.append({"Locale": row['locale'], "Avg Weekly Tasks": int(row['audit_created_units']/num_weeks), "Sampling %": f"{s_pct:.1f}%", "AHT (Secs)": f"{aht:.1f}"})
         st.dataframe(pd.DataFrame(loc_h), use_container_width=True, hide_index=True)
 
-        st.divider()
-
-        # TABLE 2: WORKFLOWS
-        st.markdown("#### 🛠️ Workflow Average")
+        # WORKFLOWS ON BOTTOM
+        st.subheader("🛠️ Workflow Average (Active Only)")
         wf_agg = qc_baseline.groupby('workflow_name').agg({'audit_created_units':'sum', 'production_created_units':'sum'}).reset_index()
-        if hide_ghosts:
-            wf_agg = wf_agg[wf_agg['workflow_name'].isin(active_wf)]
-            
         wf_h = []
         for _, row in wf_agg.iterrows():
             aht = get_trimmed_aht(f_m[f_m['Column-4:Transformation Type'] == row['workflow_name']]['Calc_AHT'])
@@ -133,7 +129,7 @@ if merc_file and qc_file:
         selected_week = st.selectbox("Select Prediction Week:", week_options)
         week_idx = week_options.index(selected_week) + 1
 
-        # TABLE 1: LOCALES
+        # LOCALES ON TOP
         st.markdown("#### 📍 Locale Forecast")
         loc_f = []
         for _, row in loc_agg.iterrows():
@@ -144,9 +140,7 @@ if merc_file and qc_file:
         if loc_f:
             st.dataframe(pd.DataFrame(loc_f).style.map(color_gap, subset=['Staffing Gap']), use_container_width=True, hide_index=True)
 
-        st.divider()
-
-        # TABLE 2: WORKFLOWS
+        # WORKFLOWS ON BOTTOM
         st.markdown("#### 🛠️ Workflow Forecast")
         wf_f = []
         for _, row in wf_agg.iterrows():
@@ -157,4 +151,4 @@ if merc_file and qc_file:
         if wf_f:
             st.dataframe(pd.DataFrame(wf_f).style.map(color_gap, subset=['Staffing Gap']), use_container_width=True, hide_index=True)
 else:
-    st.info("Upload files. The Ghost Toggle now hides inactive tasks without skewing the Growth math.")
+    st.info("Upload files to start. Toggle 'Hide Inactive' to permanently remove non-current tasks from all math.")
