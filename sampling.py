@@ -28,8 +28,8 @@ if st.sidebar.button("♻️ Reset All Data"):
 merc_file = st.sidebar.file_uploader("Upload Mercury Metrics (AHT)", type="csv")
 qc_file = st.sidebar.file_uploader("Upload Quality Central (Volume)", type="csv")
 
-hide_ghosts = st.sidebar.toggle("Active Workflows", value=True)
-qas_per_site = st.sidebar.number_input("QA Available", min_value=0.1, value=10.0)
+hide_ghosts = st.sidebar.toggle("🔍 Filter Active Workflows Only (AHT > 0)", value=True)
+qas_per_site = st.sidebar.number_input("QA Available for the Week", min_value=0.1, value=10.0)
 prod_hours = st.sidebar.slider("Daily Productive Hours", 5.0, 9.0, 7.5)
 
 # --- DATE HELPER ---
@@ -51,15 +51,26 @@ if merc_file and qc_file:
             if d[col].dtype == 'object':
                 d[col] = d[col].astype(str).str.strip()
 
-    # 2. SITE & AUTO-LOCALE
+    # 2. MULTI-SITE SELECTION & AUTO-LOCALE DISCOVERY
     all_sites = sorted(df_m['Column-1:Site'].unique())
-    selected_site = st.sidebar.selectbox("Select Site:", all_sites, index=all_sites.index('CBG') if 'CBG' in all_sites else 0)
-    site_locales = df_m[df_m['Column-1:Site'] == selected_site]['Column-2:Locale'].unique()
+    # Changed selectbox to multiselect
+    selected_sites = st.sidebar.multiselect(
+        "Select Sites:", 
+        options=all_sites, 
+        default=[all_sites[0]]
+    )
+
+    if not selected_sites:
+        st.warning("Please select at least one site from the sidebar.")
+        st.stop()
     
-    f_m_base = df_m[df_m['Column-1:Site'] == selected_site]
+    # Get all locales linked to ALL selected sites
+    site_locales = df_m[df_m['Column-1:Site'].isin(selected_sites)]['Column-2:Locale'].unique()
+    
+    f_m_base = df_m[df_m['Column-1:Site'].isin(selected_sites)]
     f_q_base = df_q[df_q['locale'].isin(site_locales)]
 
-    # 3. STABLE GROWTH (Locked at Site Level)
+    # 3. STABLE GROWTH (Aggregated for selected sites)
     batch_cols = ['execution_batch_id', 'workflow_name', 'locale', 'Audit Creation Period Week']
     df_q_all_dedup = f_q_base.groupby(batch_cols).agg({'audit_created_units': 'first'}).reset_index()
 
@@ -72,7 +83,7 @@ if merc_file and qc_file:
         return np.mean(diffs)
 
     stable_site_growth = get_stable_growth(df_q_all_dedup)
-    st.sidebar.metric(label=f"📈 Stable Site Growth", value=f"{stable_site_growth * 100:.2f}%")
+    st.sidebar.metric(label=f"📈 Group Growth Rate", value=f"{stable_site_growth * 100:.2f}%")
 
     # 4. PERFORMANCE & FILTERING
     f_m_base['Processed Units'] = pd.to_numeric(f_m_base['Processed Units'], errors='coerce').fillna(0)
@@ -110,7 +121,7 @@ if merc_file and qc_file:
     tab1, tab2 = st.tabs(["📊 Historical Audit Data", "🚀 Future Forecast Explorer"])
 
     with tab1:
-        st.subheader(f"Historical Snapshot: {selected_site}")
+        st.subheader(f"Historical Snapshot: {', '.join(selected_sites)}")
         st.markdown(f"<p class='date-header'>Snapshot Date: {today.strftime('%b %d, %Y')}</p>", unsafe_allow_html=True)
         
         loc_agg = qc_baseline.groupby('locale').agg({'audit_created_units':'sum', 'production_created_units':'sum'}).reset_index()
@@ -132,7 +143,7 @@ if merc_file and qc_file:
         st.dataframe(pd.DataFrame(wf_h), use_container_width=True, hide_index=True)
 
     with tab2:
-        st.subheader(f"Capacity Forecast: {selected_site}")
+        st.subheader(f"Capacity Forecast: {', '.join(selected_sites)}")
         week_labels = [f"Week {i} ({get_week_range(i)})" for i in range(1, 5)]
         selected_week_label = st.selectbox("Select Target Week:", week_labels)
         week_idx = week_labels.index(selected_week_label) + 1
@@ -165,4 +176,4 @@ if merc_file and qc_file:
         else:
             st.warning("No active workflows match the current filters.")
 else:
-    st.info("Upload files to generate the capacity plan.")
+    st.info("Upload files to generate the capacity plan across multiple sites.")
