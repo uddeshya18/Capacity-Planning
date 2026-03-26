@@ -40,13 +40,17 @@ if merc_file and qc_file:
             if d[col].dtype == 'object':
                 d[col] = d[col].astype(str).str.strip()
 
-    # 2. RESOLVE INACTIVE TASKS (RECENCY FILTER)
-    # We identify the last 4 weeks present in the data to exclude old Jan tasks
+    # Manual AHT Calculation
+    df_m['Calc_AHT'] = 3600 * (pd.to_numeric(df_m['Processed Hours'], errors='coerce').fillna(0) + 
+                               pd.to_numeric(df_m['Manual Skip Hours'], errors='coerce').fillna(0)) / \
+                               pd.to_numeric(df_m['Processed Units'], errors='coerce').replace(0, np.nan)
+
+    # 2. RECENCY FILTER (Last 4 Weeks only to remove old Jan tasks)
     all_weeks = sorted(df_q['Audit Creation Period Week'].unique(), reverse=True)
     recent_weeks = all_weeks[:4] 
     df_q_recent = df_q[df_q['Audit Creation Period Week'].isin(recent_weeks)]
 
-    # 3. DEDUPLICATION (Fixes en_US Scale)
+    # 3. DEDUPLICATION (Batch Level)
     batch_cols = ['execution_batch_id', 'workflow_name', 'locale', 'Audit Creation Period Week']
     df_q_dedup = df_q_recent.groupby(batch_cols).agg({
         'audit_created_units': 'first',
@@ -61,7 +65,7 @@ if merc_file and qc_file:
     f_q = df_q_dedup[df_q_dedup['locale'].isin(site_locales)]
     f_m = df_m[df_m['Column-1:Site'].isin(selected_sites)]
 
-    # Calculate Growth based on recent trend only
+    # Growth Trend (Uncapped)
     site_growth_val = 0.0
     if not f_q.empty:
         weekly_sum = f_q.groupby('Audit Creation Period Week')['audit_created_units'].sum().sort_index()
@@ -72,8 +76,8 @@ if merc_file and qc_file:
 
     st.sidebar.metric(label="📈 Recent Growth Rate", value=f"{site_growth_val * 100:.2f}%")
 
-    # 5. AGGREGATION (Average of recent weeks)
-    num_weeks = len(recent_weeks)
+    # 5. AGGREGATION
+    num_weeks = len(recent_weeks) if len(recent_weeks) > 0 else 1
     wf_base = f_q.groupby('workflow_name').agg({'audit_created_units': 'sum', 'production_created_units': 'sum'}).reset_index()
     loc_base = f_q.groupby('locale').agg({'audit_created_units': 'sum', 'production_created_units': 'sum'}).reset_index()
 
@@ -85,19 +89,21 @@ if merc_file and qc_file:
     tab1, tab2 = st.tabs(["📊 Historical Audit Data", "🚀 Future Forecast Explorer"])
 
     with tab1:
-        st.subheader("Recent Historical Averages (Last 4 Weeks)")
+        st.subheader("Historical Weekly Average (Recent)")
         col1, col2 = st.columns(2)
         
         with col1:
             st.markdown("### 🛠️ Breakdown by Workflow")
             wf_list = []
             for _, row in wf_base.iterrows():
-                aht = get_trimmed_aht(f_m[f_m['Column-4:Transformation Type'] == row['workflow_name']]['Calc_AHT'] if 'Calc_AHT' in f_m else f_m['Average Handle Time(In Secs)'])
+                aht = get_trimmed_aht(f_m[f_m['Column-4:Transformation Type'] == row['workflow_name']]['Calc_AHT'])
                 if aht > 0:
+                    # SAFETY CHECK FOR ZERO DIVISION
+                    s_pct = (row['audit_created_units'] / row['production_created_units'] * 100) if row['production_created_units'] > 0 else 0.0
                     wf_list.append({
                         "Workflow Name": row['workflow_name'],
                         "Avg Weekly Tasks": int(row['audit_created_units'] / num_weeks),
-                        "Sampling %": f"{(row['audit_created_units']/row['production_created_units']*100):.1f}%",
+                        "Sampling %": f"{s_pct:.1f}%",
                         "Cleaned AHT (s)": f"{aht:.1f}"
                     })
             st.dataframe(pd.DataFrame(wf_list), use_container_width=True, hide_index=True)
@@ -106,12 +112,14 @@ if merc_file and qc_file:
             st.markdown("### 📍 Breakdown by Locale")
             loc_list = []
             for _, row in loc_base.iterrows():
-                aht = get_trimmed_aht(f_m[f_m['Column-2:Locale'] == row['locale']]['Calc_AHT'] if 'Calc_AHT' in f_m else f_m['Average Handle Time(In Secs)'])
+                aht = get_trimmed_aht(f_m[f_m['Column-2:Locale'] == row['locale']]['Calc_AHT'])
                 if aht > 0:
+                    # SAFETY CHECK FOR ZERO DIVISION
+                    s_pct = (row['audit_created_units'] / row['production_created_units'] * 100) if row['production_created_units'] > 0 else 0.0
                     loc_list.append({
                         "Locale": row['locale'],
                         "Avg Weekly Tasks": int(row['audit_created_units'] / num_weeks),
-                        "Sampling %": f"{(row['audit_created_units']/row['production_created_units']*100):.1f}%",
+                        "Sampling %": f"{s_pct:.1f}%",
                         "Cleaned AHT (s)": f"{aht:.1f}"
                     })
             st.dataframe(pd.DataFrame(loc_list), use_container_width=True, hide_index=True)
@@ -130,7 +138,7 @@ if merc_file and qc_file:
             st.markdown(f"### 🛠️ Workflow Forecast")
             wf_pred = []
             for _, row in wf_base.iterrows():
-                aht = get_trimmed_aht(f_m[f_m['Column-4:Transformation Type'] == row['workflow_name']]['Calc_AHT'] if 'Calc_AHT' in f_m else f_m['Average Handle Time(In Secs)'])
+                aht = get_trimmed_aht(f_m[f_m['Column-4:Transformation Type'] == row['workflow_name']]['Calc_AHT'])
                 if aht > 0:
                     pred_tasks = (row['audit_created_units'] / num_weeks) * (1 + (site_growth_val * week_idx))
                     wf_pred.append({
@@ -143,7 +151,7 @@ if merc_file and qc_file:
             st.markdown(f"### 📍 Locale Forecast")
             loc_pred = []
             for _, row in loc_base.iterrows():
-                aht = get_trimmed_aht(f_m[f_m['Column-2:Locale'] == row['locale']]['Calc_AHT'] if 'Calc_AHT' in f_m else f_m['Average Handle Time(In Secs)'])
+                aht = get_trimmed_aht(f_m[f_m['Column-2:Locale'] == row['locale']]['Calc_AHT'])
                 if aht > 0:
                     pred_tasks = (row['audit_created_units'] / num_weeks) * (1 + (site_growth_val * week_idx))
                     loc_pred.append({
@@ -153,4 +161,4 @@ if merc_file and qc_file:
             st.dataframe(pd.DataFrame(loc_pred), use_container_width=True, hide_index=True)
 
 else:
-    st.info("Please upload files to see the filtered task list.")
+    st.info("Upload Mercury and QC files to resolve the error and view data.")
