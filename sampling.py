@@ -27,14 +27,14 @@ if st.sidebar.button("♻️ Reset All Data"):
 merc_file = st.sidebar.file_uploader("Upload Mercury Metrics (AHT)", type="csv")
 qc_file = st.sidebar.file_uploader("Upload Quality Central (Volume)", type="csv")
 
-# TOGGLE
-hide_ghosts = st.sidebar.toggle("🚫 Hide Inactive (Ghost) Tasks", value=True)
+# TOGGLE: Now driven by Mercury File activity
+hide_ghosts = st.sidebar.toggle("🚫 Hide Inactive (Mercury Ghosts)", value=True)
 
 qas_per_site = st.sidebar.number_input("Current Team 2 Headcount", min_value=0.1, value=10.0)
 prod_hours = st.sidebar.slider("Daily Productive Hours", 5.0, 9.0, 7.5)
 
 if merc_file and qc_file:
-    # 1. LOAD & CLEAN
+    # 1. LOAD & NORMALIZE
     df_m = pd.read_csv(merc_file)
     df_q = pd.read_csv(qc_file)
 
@@ -43,48 +43,48 @@ if merc_file and qc_file:
             if d[col].dtype == 'object':
                 d[col] = d[col].astype(str).str.strip()
 
-    # 2. CALC AHT (Mercury)
-    df_m['Calc_AHT'] = 3600 * (pd.to_numeric(df_m['Processed Hours'], errors='coerce').fillna(0) + 
-                               pd.to_numeric(df_m['Manual Skip Hours'], errors='coerce').fillna(0)) / \
-                               pd.to_numeric(df_m['Processed Units'], errors='coerce').replace(0, np.nan)
-
-    # 3. IDENTIFY GHOSTS (Tasks with 0 volume in the last 2 weeks)
-    all_weeks = sorted(df_q['Audit Creation Period Week'].unique(), reverse=True)
-    recent_2_weeks = all_weeks[:2]
+    # 2. CALC AHT & IDENTIFY MERCURY ACTIVITY
+    df_m['Processed Units'] = pd.to_numeric(df_m['Processed Units'], errors='coerce').fillna(0)
+    df_m['Processed Hours'] = pd.to_numeric(df_m['Processed Hours'], errors='coerce').fillna(0)
     
-    # Strictly define what is "Active"
-    active_mask = df_q['Audit Creation Period Week'].isin(recent_2_weeks)
-    active_wf_list = df_q[active_mask]['workflow_name'].unique()
-    active_loc_list = df_q[active_mask]['locale'].unique()
+    # Calculate AHT
+    df_m['Calc_AHT'] = 3600 * (df_m['Processed Hours'] + 
+                               pd.to_numeric(df_m['Manual Skip Hours'], errors='coerce').fillna(0)) / \
+                               df_m['Processed Units'].replace(0, np.nan)
 
-    # 4. SITE FILTERING (Apply first)
+    # 3. DEFINE ACTIVE WORKFLOWS FROM MERCURY
+    # A workflow is active ONLY if it has processed units > 0 in Mercury
+    active_mercury_wf = df_m[df_m['Processed Units'] > 0]['Column-4:Transformation Type'].unique()
+    active_mercury_loc = df_m[df_m['Processed Units'] > 0]['Column-2:Locale'].unique()
+
+    # 4. SITE FILTERING
     all_sites = sorted(df_m['Column-1:Site'].unique())
     selected_sites = st.sidebar.multiselect("Filter Site:", all_sites, default=['CBG'] if 'CBG' in all_sites else all_sites)
     
     f_m_base = df_m[df_m['Column-1:Site'].isin(selected_sites)]
     f_q_base = df_q[df_q['locale'].isin(f_m_base['Column-2:Locale'].unique())]
 
-    # 5. TASK AUDIT FEATURE (Sidebar Stats)
-    total_tasks_count = f_q_base['workflow_name'].nunique()
-    active_tasks_count = len([x for x in f_q_base['workflow_name'].unique() if x in active_wf_list])
-    ghost_tasks_count = total_tasks_count - active_tasks_count
+    # 5. GHOST AUDIT (Sidebar Stats)
+    total_wf_in_merc = f_m_base['Column-4:Transformation Type'].nunique()
+    actually_working = len([x for x in f_m_base['Column-4:Transformation Type'].unique() if x in active_mercury_wf])
+    ghost_count = total_wf_in_merc - actually_working
 
-    with st.sidebar.expander("📝 Task Inventory Summary", expanded=True):
-        st.write(f"**Total Tasks in File:** {total_tasks_count}")
-        st.write(f"**Active (Last 14 Days):** {active_tasks_count}")
-        st.write(f"**Ghost (Inactive):** {ghost_tasks_count}")
+    with st.sidebar.expander("📝 Mercury Work Summary", expanded=True):
+        st.write(f"**Total Tasks in Metrics:** {total_wf_in_merc}")
+        st.write(f"**Tasks with Work (Active):** {actually_working}")
+        st.write(f"**Ghost Tasks (No Work):** {ghost_count}")
         if hide_ghosts:
-            st.success(f"Purging {ghost_tasks_count} tasks from view.")
+            st.success(f"Purging {ghost_count} inactive workflows.")
 
-    # 6. HARD FILTER (The actual removal)
+    # 6. APPLY HARD FILTER
     if hide_ghosts:
-        f_q = f_q_base[f_q_base['workflow_name'].isin(active_wf_list)]
-        f_m = f_m_base[f_m_base['Column-4:Transformation Type'].isin(active_wf_list)]
+        f_m = f_m_base[f_m_base['Column-4:Transformation Type'].isin(active_mercury_wf)]
+        f_q = f_q_base[f_q_base['workflow_name'].isin(active_mercury_wf)]
     else:
-        f_q = f_q_base
         f_m = f_m_base
+        f_q = f_q_base
 
-    # 7. GROWTH & BASELINE
+    # 7. GROWTH & BASELINE (Calculated after filtering)
     batch_cols = ['execution_batch_id', 'workflow_name', 'locale', 'Audit Creation Period Week']
     df_q_dedup = f_q.groupby(batch_cols).agg({'audit_created_units': 'first', 'production_created_units': 'first'}).reset_index()
 
@@ -100,6 +100,7 @@ if merc_file and qc_file:
     st.sidebar.metric(label="📈 Active Growth Rate", value=f"{current_growth * 100:.2f}%")
 
     num_weeks = 4
+    all_weeks = sorted(df_q['Audit Creation Period Week'].unique(), reverse=True)
     recent_4_weeks = all_weeks[:4]
     qc_baseline = df_q_dedup[df_q_dedup['Audit Creation Period Week'].isin(recent_4_weeks)]
 
@@ -114,9 +115,8 @@ if merc_file and qc_file:
     tab1, tab2 = st.tabs(["📊 Historical Audit Data", "🚀 Future Forecast Explorer"])
 
     with tab1:
-        st.subheader("Historical Weekly Averages")
         # LOCALES TOP
-        st.markdown("#### 📍 Locale Performance")
+        st.subheader("📍 Locale Performance (Mercury Active)")
         loc_agg = qc_baseline.groupby('locale').agg({'audit_created_units':'sum', 'production_created_units':'sum'}).reset_index()
         loc_h = []
         for _, row in loc_agg.iterrows():
@@ -128,7 +128,7 @@ if merc_file and qc_file:
         st.divider()
 
         # WORKFLOWS BOTTOM
-        st.markdown("#### 🛠️ Workflow Performance")
+        st.subheader("🛠️ Workflow Performance (Mercury Active)")
         wf_agg = qc_baseline.groupby('workflow_name').agg({'audit_created_units':'sum', 'production_created_units':'sum'}).reset_index()
         wf_h = []
         for _, row in wf_agg.iterrows():
@@ -165,4 +165,4 @@ if merc_file and qc_file:
             wf_f.append({"Workflow Name": row['workflow_name'], "Expected Tasks": int(pred), "HC Needed": f"{hc:.2f}", "Staffing Gap": f"{qas_per_site - hc:.2f}"})
         st.dataframe(pd.DataFrame(wf_f).style.map(color_gap, subset=['Staffing Gap']), use_container_width=True, hide_index=True)
 else:
-    st.info("Upload files to begin. Use the sidebar to track how many tasks are being removed.")
+    st.info("Upload Mercury and QC files. Workflows are now verified against Mercury activity to eliminate ghost tasks.")
