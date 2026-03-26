@@ -6,7 +6,7 @@ from datetime import datetime, timedelta
 # --- PAGE CONFIG ---
 st.set_page_config(page_title="Strategic Capacity Planner", layout="wide")
 
-# --- UI THEME ---
+# --- UI THEME (Standard Slate/White) ---
 st.markdown("""
     <style>
     .stApp, [data-testid="stSidebar"] { background-color: #f8fafc !important; }
@@ -19,7 +19,7 @@ st.markdown("""
 
 st.title("📊 Strategic Capacity Planner")
 
-# --- SIDEBAR ---
+# --- SIDEBAR: GLOBAL CONTROLS ---
 st.sidebar.header("⚙️ Global Settings")
 merc_file = st.sidebar.file_uploader("Upload Mercury Metrics (AHT)", type="csv")
 qc_file = st.sidebar.file_uploader("Upload Quality Central (Volume)", type="csv")
@@ -42,23 +42,30 @@ if merc_file and qc_file:
             if d[col].dtype == 'object':
                 d[col] = d[col].astype(str).str.strip()
 
-    # Manual AHT Calculation
+    # Calculate AHT (Fixes blank AHT issue)
     df_m['Calc_AHT'] = 3600 * (pd.to_numeric(df_m['Processed Hours'], errors='coerce') + 
                                pd.to_numeric(df_m['Manual Skip Hours'], errors='coerce')) / \
                                pd.to_numeric(df_m['Processed Units'], errors='coerce').replace(0, np.nan)
     
-    # 2. SITE FILTERING
+    # 2. DATA DEDUPLICATION (Fixes en_US High Volume Issue)
+    # The QC file repeats batch units across rows. We must take the first per batch ID.
+    batch_cols = ['execution_batch_id', 'workflow_name', 'locale', 'Audit Creation Period Week']
+    df_q_dedup = df_q.groupby(batch_cols).agg({
+        'audit_created_units': 'first',
+        'production_created_units': 'first'
+    }).reset_index()
+
+    # 3. FILTERING & GROWTH
     all_sites = sorted(df_m['Column-1:Site'].unique())
     selected_sites = st.sidebar.multiselect("Filter Site:", all_sites, default=all_sites)
     
     site_locales = df_m[df_m['Column-1:Site'].isin(selected_sites)]['Column-2:Locale'].unique()
-    f_q = df_q[df_q['locale'].isin(site_locales)]
+    f_q = df_q_dedup[df_q_dedup['locale'].isin(site_locales)]
     f_m = df_m[df_m['Column-1:Site'].isin(selected_sites)]
 
-    # 3. GROWTH CALCULATION (Uncapped)
+    # Raw Growth Logic (Uncapped)
     site_growth_val = 0.0
     if not f_q.empty:
-        # Sum by week first to find week-over-week trend
         weekly_sum = f_q.groupby('Audit Creation Period Week')['audit_created_units'].sum().reset_index()
         u = weekly_sum['audit_created_units'].values
         if len(u) > 1:
@@ -67,85 +74,99 @@ if merc_file and qc_file:
 
     st.sidebar.metric(label="📈 Estimated Weekly Growth", value=f"{site_growth_val * 100:.2f}%")
 
-    # 4. DATA AGGREGATION (Fixed en_US Over-counting)
-    # We aggregate by Week first, then take the mean to get a true "Average Week"
-    wf_base = f_q.groupby(['workflow_name', 'Audit Creation Period Week']).agg({
-        'audit_created_units': 'sum', 'production_created_units': 'sum'
-    }).groupby('workflow_name').mean().reset_index()
-
-    loc_base = f_q.groupby(['locale', 'Audit Creation Period Week']).agg({
-        'audit_created_units': 'sum', 'production_created_units': 'sum'
-    }).groupby('locale').mean().reset_index()
+    # 4. AGGREGATION (Average Week baseline)
+    num_weeks = len(f_q['Audit Creation Period Week'].unique()) if not f_q.empty else 1
+    
+    wf_base = f_q.groupby('workflow_name').agg({
+        'audit_created_units': 'sum', 
+        'production_created_units': 'sum'
+    }).reset_index()
+    
+    loc_base = f_q.groupby('locale').agg({
+        'audit_created_units': 'sum', 
+        'production_created_units': 'sum'
+    }).reset_index()
 
     def get_trimmed_aht(series):
         clean = series.dropna()
         return clean[clean <= clean.quantile(0.95)].mean() if not clean.empty else 0
 
-    # --- TABS ---
+    # --- TABS (Mirrored Layout) ---
     tab1, tab2 = st.tabs(["📊 Historical Audit Data", "🚀 Future Forecast Explorer"])
 
-    # UI Generator Function to keep tabs looking identical
-    def render_tables(is_forecast=False, week_label=None, week_idx=0):
-        c1, c2 = st.columns(2)
+    with tab1:
+        st.subheader("Historical Weekly Average Breakdown")
+        col1, col2 = st.columns(2)
         
-        # Table 1: Workflow
-        with c1:
-            st.markdown(f"### 🛠️ Breakdown by Workflow {'(' + week_label + ')' if week_label else ''}")
+        with col1:
+            st.markdown("### 🛠️ Breakdown by Workflow")
             wf_list = []
             for _, row in wf_base.iterrows():
                 aht = get_trimmed_aht(f_m[f_m['Column-4:Transformation Type'] == row['workflow_name']]['Calc_AHT'])
                 if aht > 0:
-                    tasks = row['audit_created_units'] * (1 + (site_growth_val * week_idx))
-                    hc = (tasks * aht) / (3600 * prod_hours * 5)
-                    data = {
+                    wf_list.append({
                         "Workflow Name": row['workflow_name'],
-                        "Tasks": int(tasks),
-                        "Sampling %": f"{(row['audit_created_units']/row['production_created_units']*100):.1f}%" if not is_forecast else f"{hc:.2f} HC",
-                        "Cleaned AHT (s)": f"{aht:.1f}" if not is_forecast else f"{qas_per_site - hc:.2f} Gap"
-                    }
-                    # Rename columns for Forecast tab to match your Screenshot layout
-                    if is_forecast:
-                        data = {"Workflow Name": data["Workflow Name"], "Expected Tasks": data["Tasks"], "HC Needed": data["Sampling %"], "Staffing Gap": data["Cleaned AHT (s)"]}
-                    else:
-                        data = {"Workflow Name": data["Workflow Name"], "Avg Weekly Tasks": data["Tasks"], "Sampling %": data["Sampling %"], "Cleaned AHT (s)": data["Cleaned AHT (s)"]}
-                    wf_list.append(data)
+                        "Avg Weekly Tasks": int(row['audit_created_units'] / num_weeks),
+                        "Sampling %": f"{(row['audit_created_units']/row['production_created_units']*100):.1f}%",
+                        "Cleaned AHT (s)": f"{aht:.1f}"
+                    })
             st.dataframe(pd.DataFrame(wf_list), use_container_width=True, hide_index=True)
 
-        # Table 2: Locale
-        with c2:
-            st.markdown(f"### 📍 Breakdown by Locale {'(' + week_label + ')' if week_label else ''}")
+        with col2:
+            st.markdown("### 📍 Breakdown by Locale")
             loc_list = []
             for _, row in loc_base.iterrows():
                 aht = get_trimmed_aht(f_m[f_m['Column-2:Locale'] == row['locale']]['Calc_AHT'])
                 if aht > 0:
-                    tasks = row['audit_created_units'] * (1 + (site_growth_val * week_idx))
-                    hc = (tasks * aht) / (3600 * prod_hours * 5)
-                    data = {
+                    loc_list.append({
                         "Locale": row['locale'],
-                        "Tasks": int(tasks),
-                        "Sampling %": f"{(row['audit_created_units']/row['production_created_units']*100):.1f}%" if not is_forecast else f"{hc:.2f} HC",
-                        "Cleaned AHT (s)": f"{aht:.1f}" if not is_forecast else f"{qas_per_site - hc:.2f} Gap"
-                    }
-                    if is_forecast:
-                        data = {"Locale": data["Locale"], "Expected Tasks": data["Tasks"], "HC Needed": data["Sampling %"], "Staffing Gap": data["Cleaned AHT (s)"]}
-                    else:
-                        data = {"Locale": data["Locale"], "Avg Weekly Tasks": data["Tasks"], "Sampling %": data["Sampling %"], "Cleaned AHT (s)": data["Cleaned AHT (s)"]}
-                    loc_list.append(data)
+                        "Avg Weekly Tasks": int(row['audit_created_units'] / num_weeks),
+                        "Sampling %": f"{(row['audit_created_units']/row['production_created_units']*100):.1f}%",
+                        "Cleaned AHT (s)": f"{aht:.1f}"
+                    })
             st.dataframe(pd.DataFrame(loc_list), use_container_width=True, hide_index=True)
 
-    with tab1:
-        render_tables(is_forecast=False)
-
     with tab2:
+        st.subheader("Team 2 Verification Forecast")
         st.caption(f"📅 **Current Date:** {datetime.now().strftime('%d %b %Y')}")
-        week_options = []
-        for i in range(1, 5):
-            start = current_monday + timedelta(weeks=i)
-            end = start + timedelta(days=4)
-            week_options.append(f"Week {i} ({start.strftime('%d %b')} - {end.strftime('%d %b')})")
         
+        week_options = [f"Week {i} ({(current_monday + timedelta(weeks=i)).strftime('%d %b')} - {(current_monday + timedelta(weeks=i, days=4)).strftime('%d %b')})" for i in range(1, 5)]
         selected_week = st.selectbox("Select Prediction Week:", week_options)
-        render_tables(is_forecast=True, week_label=selected_week.split(' ')[0], week_idx=week_options.index(selected_week) + 1)
+        week_idx = week_options.index(selected_week) + 1
+
+        f_col1, f_col2 = st.columns(2)
+
+        with f_col1:
+            st.markdown(f"### 🛠️ Workflow Forecast")
+            wf_pred = []
+            for _, row in wf_base.iterrows():
+                aht = get_trimmed_aht(f_m[f_m['Column-4:Transformation Type'] == row['workflow_name']]['Calc_AHT'])
+                if aht > 0:
+                    pred_tasks = (row['audit_created_units'] / num_weeks) * (1 + (site_growth_val * week_idx))
+                    hc = (pred_tasks * aht) / (3600 * prod_hours * 5)
+                    wf_pred.append({
+                        "Workflow Name": row['workflow_name'],
+                        "Expected Tasks": int(pred_tasks),
+                        "HC Needed": f"{hc:.2f} HC",
+                        "Staffing Gap": f"{qas_per_site - hc:.2f} Gap"
+                    })
+            st.dataframe(pd.DataFrame(wf_pred), use_container_width=True, hide_index=True)
+
+        with f_col2:
+            st.markdown(f"### 📍 Locale Forecast")
+            loc_pred = []
+            for _, row in loc_base.iterrows():
+                aht = get_trimmed_aht(f_m[f_m['Column-2:Locale'] == row['locale']]['Calc_AHT'])
+                if aht > 0:
+                    pred_tasks = (row['audit_created_units'] / num_weeks) * (1 + (site_growth_val * week_idx))
+                    hc = (pred_tasks * aht) / (3600 * prod_hours * 5)
+                    loc_pred.append({
+                        "Locale": row['locale'],
+                        "Expected Tasks": int(pred_tasks),
+                        "HC Needed": f"{hc:.2f} HC",
+                        "Staffing Gap": f"{qas_per_site - hc:.2f} Gap"
+                    })
+            st.dataframe(pd.DataFrame(loc_pred), use_container_width=True, hide_index=True)
 
 else:
-    st.info("Please upload your Mercury and Quality Central CSV files.")
+    st.info("Please upload your Mercury and QC files to continue.")
