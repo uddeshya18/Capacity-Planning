@@ -1,163 +1,179 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-from datetime import datetime
+from datetime import datetime, timedelta
 
-# --- SET PAGE CONFIG ---
+# --- PAGE CONFIG ---
 st.set_page_config(page_title="Strategic Capacity Planner", layout="wide")
 
-# --- CUSTOM CSS FOR UI CONSISTENCY ---
+# --- UI THEME ---
 st.markdown("""
     <style>
-    .main { background-color: #f5f7f9; }
-    .stMetric { background-color: #ffffff; padding: 15px; border-radius: 10px; box-shadow: 0 2px 4px rgba(0,0,0,0.05); }
-    [data-testid="stSidebar"] { background-color: #ffffff; border-right: 1px solid #e6e9ef; }
+    .stApp { background-color: #f8fafc !important; }
+    div[data-testid="metric-container"] {
+        background-color: #ffffff; border: 1px solid #e2e8f0;
+        padding: 20px; border-radius: 12px;
+    }
+    .date-header { font-size: 1.1rem; font-weight: 600; color: #475569; }
     </style>
     """, unsafe_allow_html=True)
 
-# --- SIDEBAR: CONTROLS & UPLOADS ---
-with st.sidebar:
-    st.header("⚙️ Configuration")
+st.title("📊 Strategic Capacity Planner")
+
+# --- SIDEBAR ---
+st.sidebar.header("⚙️ Global Settings")
+if st.sidebar.button("♻️ Reset All Data"):
+    st.rerun()
+
+merc_file = st.sidebar.file_uploader("Upload Mercury Metrics (AHT)", type="csv")
+qc_file = st.sidebar.file_uploader("Upload Quality Central (Volume)", type="csv")
+
+hide_ghosts = st.sidebar.toggle("🔍 Filter Active Workflows Only (AHT > 0)", value=True)
+qas_per_site = st.sidebar.number_input("QA Available for the Week", min_value=0.1, value=10.0)
+prod_hours = st.sidebar.slider("Daily Productive Hours", 5.0, 9.0, 7.5)
+
+# --- DATE HELPER ---
+today = datetime.now()
+next_monday = today + timedelta(days=(7 - today.weekday()) % 7)
+
+def get_week_range(weeks_ahead):
+    start = next_monday + timedelta(weeks=weeks_ahead-1)
+    end = start + timedelta(days=4)
+    return f"{start.strftime('%b %d')} - {end.strftime('%b %d, %Y')}"
+
+if merc_file and qc_file:
+    # 1. LOAD & NORMALIZE
+    df_m = pd.read_csv(merc_file)
+    df_q = pd.read_csv(qc_file)
+
+    for d in [df_m, df_q]:
+        for col in d.columns:
+            if d[col].dtype == 'object':
+                d[col] = d[col].astype(str).str.strip()
+
+    # 2. MULTI-SITE SELECTION & AUTO-LOCALE DISCOVERY
+    all_sites = sorted(df_m['Column-1:Site'].unique())
+    # Changed selectbox to multiselect
+    selected_sites = st.sidebar.multiselect(
+        "Select Sites:", 
+        options=all_sites, 
+        default=[all_sites[0]]
+    )
+
+    if not selected_sites:
+        st.warning("Please select at least one site from the sidebar.")
+        st.stop()
     
-    file_mercury = st.file_uploader("Upload Mercury Metrics (CSV)", type="csv")
-    file_qc = st.file_uploader("Upload Quality Central (CSV)", type="csv")
+    # Get all locales linked to ALL selected sites
+    site_locales = df_m[df_m['Column-1:Site'].isin(selected_sites)]['Column-2:Locale'].unique()
     
-    st.divider()
-    
-    qa_available = st.number_input("QA Available for the Week", min_value=1, value=20)
-    prod_hours = st.slider("Daily Productive Hours", 5.0, 9.0, 7.5, 0.5)
-    
-    st.divider()
-    filter_active = st.checkbox("Filter Active Workflows Only (AHT > 0)", value=True)
+    f_m_base = df_m[df_m['Column-1:Site'].isin(selected_sites)]
+    f_q_base = df_q[df_q['locale'].isin(site_locales)]
 
-# --- DATA PROCESSING ENGINE ---
-def load_and_process():
-    if file_mercury and file_qc:
-        try:
-            df_m = pd.read_csv(file_mercury)
-            df_q = pd.read_csv(file_qc)
-            
-            # Clean column names (strip spaces)
-            df_m.columns = df_m.columns.str.strip()
-            df_q.columns = df_q.columns.str.strip()
+    # 3. STABLE GROWTH (Aggregated for selected sites)
+    batch_cols = ['execution_batch_id', 'workflow_name', 'locale', 'Audit Creation Period Week']
+    df_q_all_dedup = f_q_base.groupby(batch_cols).agg({'audit_created_units': 'first'}).reset_index()
 
-            # 1. Map Mercury Columns (Site Production)
-            # site_col = 'Column-1:Site', locale_col = 'Column-2:Locale', workflow_col = 'Column-4:Transformation Type'
-            m_units_col = 'Processed Units'
-            m_hours_col = 'Processed Hours'
-            m_skip_col = 'Manual Skip Hours'
-            
-            df_m[m_units_col] = pd.to_numeric(df_m[m_units_col], errors='coerce').fillna(0)
-            df_m[m_hours_col] = pd.to_numeric(df_m[m_hours_col], errors='coerce').fillna(0)
-            df_m[m_skip_col] = pd.to_numeric(df_m[m_skip_col], errors='coerce').fillna(0)
-            
-            # AHT Formula: 3600 * (Hours + Skip Hours) / Units
-            df_m['Calc_AHT'] = 3600 * (df_m[m_hours_col] + df_m[m_skip_col]) / df_m[m_units_col].replace(0, np.nan)
-            df_m['Calc_AHT'] = df_m['Calc_AHT'].fillna(0)
-            
-            # 2. Map QC Columns (Audited Units)
-            # week_col = 'Audit Creation Period Week', audited_units = 'audit_completed_units'
-            q_workflow_col = 'workflow_name'
-            q_locale_col = 'locale'
-            q_units_col = 'audit_completed_units'
-            q_week_col = 'Audit Creation Period Week'
+    def get_stable_growth(data):
+        if data.empty: return 0.0
+        weekly_sum = data.groupby('Audit Creation Period Week')['audit_created_units'].sum().sort_index()
+        u = weekly_sum.values
+        if len(u) < 2: return 0.0
+        diffs = [(u[i] - u[i-1]) / u[i-1] for i in range(1, len(u)) if u[i-1] > 0]
+        return np.mean(diffs)
 
-            # Standardizing internal names
-            df_q['processed_units'] = pd.to_numeric(df_q[q_units_col], errors='coerce').fillna(0)
-            df_q['week'] = pd.to_datetime(df_q[q_week_col], errors='coerce')
-            
-            # 3. Calculate Stable Growth (From QC Week-over-Week)
-            weekly_trend = df_q.groupby('week')['processed_units'].sum().sort_index()
-            growth_pct = weekly_trend.pct_change().mean()
-            stable_growth = growth_pct if not (np.isnan(growth_pct) or np.isinf(growth_pct)) else 0.0529
-            
-            # 4. Join Files for Sampling %
-            m_agg = df_m.groupby(['Column-4:Transformation Type', 'Column-2:Locale', 'Column-1:Site']).agg({
-                'Processed Units': 'sum',
-                'Calc_AHT': 'mean' 
-            }).reset_index()
-            
-            q_agg = df_q.groupby([q_workflow_col, q_locale_col]).agg({
-                'processed_units': 'mean' 
-            }).reset_index()
-            
-            # Merge: QC Workflow to Mercury Transformation Type
-            master = pd.merge(
-                q_agg, 
-                m_agg, 
-                left_on=[q_workflow_col, q_locale_col], 
-                right_on=['Column-4:Transformation Type', 'Column-2:Locale'], 
-                how='left'
-            )
-            
-            # Sampling % = Audited (QC) / Total Site Production (Mercury)
-            master['Sampling %'] = (master['processed_units'] / master['Processed Units'].replace(0, np.nan)) * 100
-            master['Sampling %'] = master['Sampling %'].fillna(0)
-            
-            return master, stable_growth
-        except Exception as e:
-            st.error(f"Data Error: {e}")
-            return None, 0.0529
-    return None, 0.0529
+    stable_site_growth = get_stable_growth(df_q_all_dedup)
+    st.sidebar.metric(label=f"📈 Group Growth Rate", value=f"{stable_site_growth * 100:.2f}%")
 
-master_data, growth_rate = load_and_process()
+    # 4. PERFORMANCE & FILTERING
+    f_m_base['Processed Units'] = pd.to_numeric(f_m_base['Processed Units'], errors='coerce').fillna(0)
+    f_m_base['Processed Hours'] = pd.to_numeric(f_m_base['Processed Hours'], errors='coerce').fillna(0)
+    f_m_base['Calc_AHT'] = 3600 * (f_m_base['Processed Hours'] + 
+                                   pd.to_numeric(f_m_base['Manual Skip Hours'], errors='coerce').fillna(0)) / \
+                                   f_m_base['Processed Units'].replace(0, np.nan)
+    f_m_base['Calc_AHT'] = f_m_base['Calc_AHT'].fillna(0)
 
-# --- MAIN UI ---
-st.title("Strategic Capacity Planner")
+    real_workflows = f_m_base[f_m_base['Calc_AHT'] > 0]['Column-4:Transformation Type'].unique()
 
-if master_data is not None:
-    # Sidebar Site Filter
-    site_list = master_data['Column-1:Site'].dropna().unique()
-    sites = st.sidebar.multiselect("Select Sites", options=site_list, default=site_list)
-    df_filtered = master_data[master_data['Column-1:Site'].isin(sites)]
-    
-    if filter_active:
-        df_filtered = df_filtered[df_filtered['Calc_AHT'] > 0]
+    if hide_ghosts:
+        f_q = f_q_base[f_q_base['workflow_name'].isin(real_workflows)]
+        f_m = f_m_base[f_m_base['Column-4:Transformation Type'].isin(real_workflows)]
+    else:
+        f_q = f_q_base
+        f_m = f_m_base
 
-    # Metrics Row
-    col1, col2, col3 = st.columns(3)
-    col1.metric("Site Group Growth", f"{growth_rate:.2%}")
-    col2.metric("Total Active Locales", len(df_filtered['locale'].unique()) if 'locale' in df_filtered else 0)
-    col3.metric("Avg Sampling Rate", f"{df_filtered['Sampling %'].mean():.1f}%")
+    # 5. BASELINE AGGREGATION
+    df_q_final_dedup = f_q.groupby(batch_cols).agg({'audit_created_units': 'first', 'production_created_units': 'first'}).reset_index()
+    num_weeks = 4
+    all_weeks = sorted(df_q['Audit Creation Period Week'].unique(), reverse=True)
+    recent_4_weeks = all_weeks[:4]
+    qc_baseline = df_q_final_dedup[df_q_final_dedup['Audit Creation Period Week'].isin(recent_4_weeks)]
 
-    tab1, tab2 = st.tabs(["📊 Historical Audit Data", "🔮 Forecast Explorer"])
+    def get_trimmed_aht(series):
+        clean = series.dropna()
+        return clean[clean <= clean.quantile(0.95)].mean() if not clean.empty else 0
+
+    def color_gap(val):
+        try: return 'color: red; font-weight: bold' if float(val) < 0 else 'color: green; font-weight: bold'
+        except: return ''
+
+    # --- TABS ---
+    tab1, tab2 = st.tabs(["📊 Historical Audit Data", "🚀 Future Forecast Explorer"])
 
     with tab1:
-        st.subheader("Historical 4-Week Baseline")
-        display_cols = ['Column-1:Site', 'locale', 'workflow_name', 'processed_units', 'Sampling %', 'Calc_AHT']
-        st.dataframe(
-            df_filtered[display_cols].rename(columns={
-                'processed_units': 'Avg Weekly Audits',
-                'Calc_AHT': 'AHT (Secs)'
-            }), 
-            use_container_width=True
-        )
+        st.subheader(f"Historical Snapshot: {', '.join(selected_sites)}")
+        st.markdown(f"<p class='date-header'>Snapshot Date: {today.strftime('%b %d, %Y')}</p>", unsafe_allow_html=True)
+        
+        loc_agg = qc_baseline.groupby('locale').agg({'audit_created_units':'sum', 'production_created_units':'sum'}).reset_index()
+        loc_h = []
+        for _, row in loc_agg.iterrows():
+            aht = get_trimmed_aht(f_m[f_m['Column-2:Locale'] == row['locale']]['Calc_AHT'])
+            s_pct = (row['audit_created_units']/row['production_created_units']*100) if row['production_created_units']>0 else 0
+            loc_h.append({"Locale": row['locale'], "Avg Weekly Units": int(row['audit_created_units']/num_weeks), "Sampling %": f"{s_pct:.1f}%", "AHT (Secs)": f"{aht:.1f}"})
+        st.dataframe(pd.DataFrame(loc_h), use_container_width=True, hide_index=True)
+
+        st.divider()
+
+        wf_agg = qc_baseline.groupby('workflow_name').agg({'audit_created_units':'sum', 'production_created_units':'sum'}).reset_index()
+        wf_h = []
+        for _, row in wf_agg.iterrows():
+            aht = get_trimmed_aht(f_m[f_m['Column-4:Transformation Type'] == row['workflow_name']]['Calc_AHT'])
+            s_pct = (row['audit_created_units']/row['production_created_units']*100) if row['production_created_units']>0 else 0
+            wf_h.append({"Workflow Name": row['workflow_name'], "Avg Weekly Units": int(row['audit_created_units']/num_weeks), "Sampling %": f"{s_pct:.1f}%", "AHT (Secs)": f"{aht:.1f}"})
+        st.dataframe(pd.DataFrame(wf_h), use_container_width=True, hide_index=True)
 
     with tab2:
-        st.subheader("Capacity Forecast")
-        target_week = st.selectbox("Select Forecast Week", ["Week 1", "Week 2", "Week 3", "Week 4"])
-        week_num = int(target_week.split()[-1])
-        
-        # Projected Math
-        df_filtered['Expected Units'] = df_filtered['processed_units'] * (1 + growth_rate)**week_num
-        df_filtered['Hours Needed'] = (df_filtered['Expected Units'] * df_filtered['Calc_AHT']) / 3600
-        df_filtered['HC Needed'] = df_filtered['Hours Needed'] / (prod_hours * 5)
-        
-        total_hc_needed = df_filtered['HC Needed'].sum()
-        staffing_gap = qa_available - total_hc_needed
-        
-        # Forecast Summary
-        f_col1, f_col2 = st.columns(2)
-        f_col1.metric("Total HC Needed", f"{total_hc_needed:.2f}")
-        f_col2.metric("Staffing Gap", f"{staffing_gap:.2f}", 
-                     delta=f"{staffing_gap:.2f}", 
-                     delta_color="normal")
-        
-        st.dataframe(
-            df_filtered[['locale', 'workflow_name', 'Expected Units', 'HC Needed']]
-            .style.format({'Expected Units': '{:.0f}', 'HC Needed': '{:.2f}'}),
-            use_container_width=True
-        )
+        st.subheader(f"Capacity Forecast: {', '.join(selected_sites)}")
+        week_labels = [f"Week {i} ({get_week_range(i)})" for i in range(1, 5)]
+        selected_week_label = st.selectbox("Select Target Week:", week_labels)
+        week_idx = week_labels.index(selected_week_label) + 1
 
+        # LOCALE PREDICTION
+        st.markdown("#### 📍 Locale Prediction")
+        loc_f = []
+        for _, row in loc_agg.iterrows():
+            aht = get_trimmed_aht(f_m[f_m['Column-2:Locale'] == row['locale']]['Calc_AHT'])
+            pred = (row['audit_created_units']/num_weeks) * (1 + (stable_site_growth * week_idx))
+            hc = (pred * aht) / (3600 * prod_hours * 5)
+            if hc > 0 or not hide_ghosts:
+                loc_f.append({"Locale": row['locale'], "Expected Units": int(pred), "HC Needed": f"{hc:.2f}", "Staffing Gap": f"{qas_per_site - hc:.2f}"})
+        st.dataframe(pd.DataFrame(loc_f).style.applymap(color_gap, subset=['Staffing Gap']), use_container_width=True, hide_index=True)
+
+        st.divider()
+
+        # WORKFLOW PREDICTION
+        st.markdown("#### 🛠️ Workflow Prediction")
+        wf_f = []
+        for _, row in wf_agg.iterrows():
+            aht = get_trimmed_aht(f_m[f_m['Column-4:Transformation Type'] == row['workflow_name']]['Calc_AHT'])
+            pred = (row['audit_created_units']/num_weeks) * (1 + (stable_site_growth * week_idx))
+            hc = (pred * aht) / (3600 * prod_hours * 5)
+            if hc > 0 or not hide_ghosts:
+                wf_f.append({"Workflow Name": row['workflow_name'], "Expected Units": int(pred), "HC Needed": f"{hc:.2f}", "Staffing Gap": f"{qas_per_site - hc:.2f}"})
+        
+        if wf_f:
+            st.dataframe(pd.DataFrame(wf_f).style.applymap(color_gap, subset=['Staffing Gap']), use_container_width=True, hide_index=True)
+        else:
+            st.warning("No active workflows match the current filters.")
 else:
-    st.info("Please upload both Mercury Metrics and Quality Central CSV files to begin.")
+    st.info("Upload files to generate the capacity plan across multiple sites.")
