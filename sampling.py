@@ -53,7 +53,6 @@ if merc_file and qc_file:
 
     # 2. MULTI-SITE SELECTION & AUTO-LOCALE DISCOVERY
     all_sites = sorted(df_m['Column-1:Site'].unique())
-    # Changed selectbox to multiselect
     selected_sites = st.sidebar.multiselect(
         "Select Sites:", 
         options=all_sites, 
@@ -124,22 +123,22 @@ if merc_file and qc_file:
         st.subheader(f"Historical Snapshot: {', '.join(selected_sites)}")
         st.markdown(f"<p class='date-header'>Snapshot Date: {today.strftime('%b %d, %Y')}</p>", unsafe_allow_html=True)
         
+        # Locale Table (Sampling % Removed)
         loc_agg = qc_baseline.groupby('locale').agg({'audit_created_units':'sum', 'production_created_units':'sum'}).reset_index()
         loc_h = []
         for _, row in loc_agg.iterrows():
             aht = get_trimmed_aht(f_m[f_m['Column-2:Locale'] == row['locale']]['Calc_AHT'])
-            s_pct = (row['audit_created_units']/row['production_created_units']*100) if row['production_created_units']>0 else 0
-            loc_h.append({"Locale": row['locale'], "Avg Weekly Units": int(row['audit_created_units']/num_weeks), "Sampling %": f"{s_pct:.1f}%", "AHT (Secs)": f"{aht:.1f}"})
+            loc_h.append({"Locale": row['locale'], "Avg Weekly Units": int(row['audit_created_units']/num_weeks), "AHT (Secs)": f"{aht:.1f}"})
         st.dataframe(pd.DataFrame(loc_h), use_container_width=True, hide_index=True)
 
         st.divider()
 
+        # Workflow Table (Sampling % Removed)
         wf_agg = qc_baseline.groupby('workflow_name').agg({'audit_created_units':'sum', 'production_created_units':'sum'}).reset_index()
         wf_h = []
         for _, row in wf_agg.iterrows():
             aht = get_trimmed_aht(f_m[f_m['Column-4:Transformation Type'] == row['workflow_name']]['Calc_AHT'])
-            s_pct = (row['audit_created_units']/row['production_created_units']*100) if row['production_created_units']>0 else 0
-            wf_h.append({"Workflow Name": row['workflow_name'], "Avg Weekly Units": int(row['audit_created_units']/num_weeks), "Sampling %": f"{s_pct:.1f}%", "AHT (Secs)": f"{aht:.1f}"})
+            wf_h.append({"Workflow Name": row['workflow_name'], "Avg Weekly Units": int(row['audit_created_units']/num_weeks), "AHT (Secs)": f"{aht:.1f}"})
         st.dataframe(pd.DataFrame(wf_h), use_container_width=True, hide_index=True)
 
     with tab2:
