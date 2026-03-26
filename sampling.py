@@ -43,19 +43,18 @@ if merc_file and qc_file:
             if d[col].dtype == 'object':
                 d[col] = d[col].astype(str).str.strip()
 
-    # 2. GLOBAL LOCALE FILTER (The Fix)
-    all_locales = sorted(df_m['Column-2:Locale'].unique())
-    selected_locales = st.sidebar.multiselect(
-        "Select Locales to View:", 
-        options=all_locales, 
-        default=['en_US'] if 'en_US' in all_locales else [all_locales[0]]
-    )
+    # 2. SITE SELECTION & AUTOMATIC LOCALE DISCOVERY
+    all_sites = sorted(df_m['Column-1:Site'].unique())
+    selected_site = st.sidebar.selectbox("Select Site:", all_sites, index=all_sites.index('CBG') if 'CBG' in all_sites else 0)
+    
+    # Get EVERY locale linked to this site in the Mercury file
+    site_locales = df_m[df_m['Column-1:Site'] == selected_site]['Column-2:Locale'].unique()
+    
+    # Filter base data for the entire Site
+    f_m_base = df_m[df_m['Column-1:Site'] == selected_site]
+    f_q_base = df_q[df_q['locale'].isin(site_locales)]
 
-    # Filter base dataframes by selected locales
-    f_m_base = df_m[df_m['Column-2:Locale'].isin(selected_locales)]
-    f_q_base = df_q[df_q['locale'].isin(selected_locales)]
-
-    # 3. CALCULATE AHT & HC FOR GHOST DETECTION
+    # 3. PRE-CALCULATE PERFORMANCE FOR GHOST DETECTION
     f_m_base['Processed Units'] = pd.to_numeric(f_m_base['Processed Units'], errors='coerce').fillna(0)
     f_m_base['Processed Hours'] = pd.to_numeric(f_m_base['Processed Hours'], errors='coerce').fillna(0)
     
@@ -64,20 +63,20 @@ if merc_file and qc_file:
                                    f_m_base['Processed Units'].replace(0, np.nan)
     f_m_base['Calc_AHT'] = f_m_base['Calc_AHT'].fillna(0)
 
-    # A workflow is "Real" if Mercury has Processed Units AND AHT > 0
+    # A workflow is "Real" if AHT > 0
     real_workflows = f_m_base[f_m_base['Calc_AHT'] > 0]['Column-4:Transformation Type'].unique()
 
-    # 4. DATA INVENTORY STATS (Sidebar)
+    # 4. TASK INVENTORY AUDIT
     total_tasks = f_q_base['workflow_name'].nunique()
     active_tasks = len([x for x in f_q_base['workflow_name'].unique() if x in real_workflows])
     ghosts_found = total_tasks - active_tasks
 
-    with st.sidebar.expander("📝 Task Inventory Summary", expanded=True):
-        st.write(f"**Locales Selected:** {', '.join(selected_locales)}")
+    with st.sidebar.expander("📝 Site Data Summary", expanded=True):
+        st.write(f"**Site:** {selected_site}")
+        st.write(f"**Locales Included:** {', '.join(site_locales)}")
         st.write(f"**Total Tasks Found:** {total_tasks}")
-        st.write(f"**Tasks with Activity:** {active_tasks}")
         if hide_ghosts:
-            st.success(f"Purged {ghosts_found} Ghost tasks.")
+            st.success(f"**Active Tasks:** {active_tasks} (Purged {ghosts_found})")
 
     # 5. APPLY FILTER
     if hide_ghosts:
@@ -100,8 +99,9 @@ if merc_file and qc_file:
         return np.mean(diffs)
 
     current_growth = get_growth(df_q_dedup)
-    st.sidebar.metric(label="📈 Avg Growth (Selected Locales)", value=f"{current_growth * 100:.2f}%")
+    st.sidebar.metric(label=f"📈 {selected_site} Growth Rate", value=f"{current_growth * 100:.2f}%")
 
+    # 7. BASELINE (Last 4 Weeks)
     num_weeks = 4
     all_weeks = sorted(df_q['Audit Creation Period Week'].unique(), reverse=True)
     recent_4_weeks = all_weeks[:4]
@@ -118,9 +118,10 @@ if merc_file and qc_file:
     tab1, tab2 = st.tabs(["📊 Historical Audit Data", "🚀 Future Forecast Explorer"])
 
     with tab1:
-        st.subheader("Historical Weekly Averages")
+        st.subheader(f"Historical Performance for {selected_site}")
+        
         # TABLE 1: LOCALES
-        st.markdown("#### 📍 Locale Performance")
+        st.markdown("#### 📍 Locale Performance (All Site Locales)")
         loc_agg = qc_baseline.groupby('locale').agg({'audit_created_units':'sum', 'production_created_units':'sum'}).reset_index()
         loc_h = []
         for _, row in loc_agg.iterrows():
@@ -140,7 +141,7 @@ if merc_file and qc_file:
         st.dataframe(pd.DataFrame(wf_h), use_container_width=True, hide_index=True)
 
     with tab2:
-        st.subheader("Capacity Forecast Explorer")
+        st.subheader(f"Capacity Forecast for {selected_site}")
         week_options = ["Week 1", "Week 2", "Week 3", "Week 4"]
         selected_week = st.selectbox("Select Prediction Week:", week_options)
         week_idx = week_options.index(selected_week) + 1
@@ -165,4 +166,4 @@ if merc_file and qc_file:
             wf_f.append({"Workflow Name": row['workflow_name'], "Expected Units": int(pred), "HC Needed": f"{hc:.2f}", "Staffing Gap": f"{qas_per_site - hc:.2f}"})
         st.dataframe(pd.DataFrame(wf_f).style.map(color_gap, subset=['Staffing Gap']), use_container_width=True, hide_index=True)
 else:
-    st.info("Upload files. You can now select multiple locales in the sidebar.")
+    st.info("Upload files. Selecting a site will now automatically load all associated locales.")
