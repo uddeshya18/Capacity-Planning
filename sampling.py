@@ -28,8 +28,8 @@ if st.sidebar.button("♻️ Reset All Data"):
 merc_file = st.sidebar.file_uploader("Upload Mercury Metrics (AHT)", type="csv")
 qc_file = st.sidebar.file_uploader("Upload Quality Central (Volume)", type="csv")
 
-hide_ghosts = st.sidebar.toggle("🔍 Filter Active Workflows Only (AHT > 0)", value=True)
-qas_per_site = st.sidebar.number_input("QA Available for the Week", min_value=0.1, value=10.0)
+hide_ghosts = st.sidebar.toggle("Active Workflows", value=True)
+qas_per_site = st.sidebar.number_input("QA Available", min_value=0.1, value=10.0)
 prod_hours = st.sidebar.slider("Daily Productive Hours", 5.0, 9.0, 7.5)
 
 # --- DATE HELPER ---
