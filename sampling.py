@@ -28,11 +28,8 @@ if st.sidebar.button("♻️ Reset All Data"):
 merc_file = st.sidebar.file_uploader("Upload Mercury Metrics (AHT)", type="csv")
 qc_file = st.sidebar.file_uploader("Upload Quality Central (Volume)", type="csv")
 
-# UPDATED TOGGLE NAME
-hide_ghosts = st.sidebar.toggle("🔍 Filter Active Workflows Only (AHT > 0)", value=True)
-
-# UPDATED HEADCOUNT NAME
-qas_per_site = st.sidebar.number_input("QA Available for the Week", min_value=0.1, value=10.0)
+hide_ghosts = st.sidebar.toggle("Active Workflows", value=True)
+qas_per_site = st.sidebar.number_input("QA Available", min_value=0.1, value=10.0)
 prod_hours = st.sidebar.slider("Daily Productive Hours", 5.0, 9.0, 7.5)
 
 # --- DATE HELPER ---
@@ -62,7 +59,7 @@ if merc_file and qc_file:
     f_m_base = df_m[df_m['Column-1:Site'] == selected_site]
     f_q_base = df_q[df_q['locale'].isin(site_locales)]
 
-    # 3. STABLE GROWTH
+    # 3. STABLE GROWTH (Locked at Site Level)
     batch_cols = ['execution_batch_id', 'workflow_name', 'locale', 'Audit Creation Period Week']
     df_q_all_dedup = f_q_base.groupby(batch_cols).agg({'audit_created_units': 'first'}).reset_index()
 
@@ -77,7 +74,7 @@ if merc_file and qc_file:
     stable_site_growth = get_stable_growth(df_q_all_dedup)
     st.sidebar.metric(label=f"📈 Stable Site Growth", value=f"{stable_site_growth * 100:.2f}%")
 
-    # 4. PERFORMANCE CALCULATION
+    # 4. PERFORMANCE & FILTERING
     f_m_base['Processed Units'] = pd.to_numeric(f_m_base['Processed Units'], errors='coerce').fillna(0)
     f_m_base['Processed Hours'] = pd.to_numeric(f_m_base['Processed Hours'], errors='coerce').fillna(0)
     f_m_base['Calc_AHT'] = 3600 * (f_m_base['Processed Hours'] + 
@@ -87,7 +84,6 @@ if merc_file and qc_file:
 
     real_workflows = f_m_base[f_m_base['Calc_AHT'] > 0]['Column-4:Transformation Type'].unique()
 
-    # 5. FILTERING
     if hide_ghosts:
         f_q = f_q_base[f_q_base['workflow_name'].isin(real_workflows)]
         f_m = f_m_base[f_m_base['Column-4:Transformation Type'].isin(real_workflows)]
@@ -95,7 +91,7 @@ if merc_file and qc_file:
         f_q = f_q_base
         f_m = f_m_base
 
-    # 6. BASELINE AGGREGATION
+    # 5. BASELINE AGGREGATION
     df_q_final_dedup = f_q.groupby(batch_cols).agg({'audit_created_units': 'first', 'production_created_units': 'first'}).reset_index()
     num_weeks = 4
     all_weeks = sorted(df_q['Audit Creation Period Week'].unique(), reverse=True)
@@ -141,26 +137,7 @@ if merc_file and qc_file:
         selected_week_label = st.selectbox("Select Target Week:", week_labels)
         week_idx = week_labels.index(selected_week_label) + 1
 
-        # PRE-CALC TOTALS FOR SUMMARY
-        total_hc_needed = 0
-        wf_f_list = []
-        for _, row in wf_agg.iterrows():
-            aht = get_trimmed_aht(f_m[f_m['Column-4:Transformation Type'] == row['workflow_name']]['Calc_AHT'])
-            pred = (row['audit_created_units']/num_weeks) * (1 + (stable_site_growth * week_idx))
-            hc = (pred * aht) / (3600 * prod_hours * 5)
-            if hc > 0 or not hide_ghosts:
-                wf_f_list.append({"Workflow Name": row['workflow_name'], "Expected Units": int(pred), "HC Needed": hc, "Staffing Gap": qas_per_site - hc})
-                total_hc_needed += hc
-
-        # SUMMARY METRICS
-        col1, col2, col3 = st.columns(3)
-        col1.metric("Total HC Needed", f"{total_hc_needed:.2f}")
-        col2.metric("QA Available", f"{qas_per_site:.2f}")
-        col3.metric("Net Staffing Gap", f"{qas_per_site - total_hc_needed:.2f}", 
-                   delta_color="normal")
-
-        st.divider()
-
+        # LOCALE PREDICTION
         st.markdown("#### 📍 Locale Prediction")
         loc_f = []
         for _, row in loc_agg.iterrows():
@@ -173,13 +150,19 @@ if merc_file and qc_file:
 
         st.divider()
 
+        # WORKFLOW PREDICTION
         st.markdown("#### 🛠️ Workflow Prediction")
-        if wf_f_list:
-            df_wf_f = pd.DataFrame(wf_f_list)
-            df_wf_f['HC Needed'] = df_wf_f['HC Needed'].map('{:,.2f}'.format)
-            df_wf_f['Staffing Gap'] = df_wf_f['Staffing Gap'].map('{:,.2f}'.format)
-            st.dataframe(df_wf_f.style.applymap(color_gap, subset=['Staffing Gap']), use_container_width=True, hide_index=True)
+        wf_f = []
+        for _, row in wf_agg.iterrows():
+            aht = get_trimmed_aht(f_m[f_m['Column-4:Transformation Type'] == row['workflow_name']]['Calc_AHT'])
+            pred = (row['audit_created_units']/num_weeks) * (1 + (stable_site_growth * week_idx))
+            hc = (pred * aht) / (3600 * prod_hours * 5)
+            if hc > 0 or not hide_ghosts:
+                wf_f.append({"Workflow Name": row['workflow_name'], "Expected Units": int(pred), "HC Needed": f"{hc:.2f}", "Staffing Gap": f"{qas_per_site - hc:.2f}"})
+        
+        if wf_f:
+            st.dataframe(pd.DataFrame(wf_f).style.applymap(color_gap, subset=['Staffing Gap']), use_container_width=True, hide_index=True)
         else:
             st.warning("No active workflows match the current filters.")
 else:
-    st.info("Please upload Mercury Metrics and QC files to generate the capacity plan.")
+    st.info("Upload files to generate the capacity plan.")
