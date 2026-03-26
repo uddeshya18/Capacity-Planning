@@ -24,7 +24,7 @@ st.sidebar.header("⚙️ Global Settings")
 merc_file = st.sidebar.file_uploader("Upload Mercury Metrics (AHT)", type="csv")
 qc_file = st.sidebar.file_uploader("Upload Quality Central (Volume)", type="csv")
 
-qas_per_site = st.sidebar.number_input("Current QAs per Locale", min_value=1, value=10)
+qas_per_site = st.sidebar.number_input("Current QAs (Total)", min_value=1, value=10)
 prod_hours = st.sidebar.slider("Daily Productive Hours", 5.0, 9.0, 7.5)
 
 def get_monday(d):
@@ -37,13 +37,16 @@ if merc_file and qc_file:
     df_m = pd.read_csv(merc_file)
     df_q = pd.read_csv(qc_file)
 
+    # Clean strings and fix numeric errors
     for d in [df_m, df_q]:
         for col in d.columns:
             if d[col].dtype == 'object':
                 d[col] = d[col].astype(str).str.strip()
 
-    # Calculate Manual AHT from Mercury
-    df_m['Raw_AHT'] = 3600 * (df_m['Processed Hours'] + df_m['Manual Skip Hours']) / df_m['Processed Units'].replace(0, np.nan)
+    # Calculate AHT from Mercury (Manual formula to ensure accuracy)
+    df_m['Calc_AHT'] = 3600 * (pd.to_numeric(df_m['Processed Hours'], errors='coerce') + 
+                               pd.to_numeric(df_m['Manual Skip Hours'], errors='coerce')) / \
+                               pd.to_numeric(df_m['Processed Units'], errors='coerce').replace(0, np.nan)
     
     # 2. GROWTH & FILTERS
     all_sites = sorted(df_m['Column-1:Site'].unique())
@@ -53,7 +56,7 @@ if merc_file and qc_file:
     site_locales = df_m[df_m['Column-1:Site'].isin(selected_sites)]['Column-2:Locale'].unique()
     df_q_filtered = df_q[df_q['locale'].isin(site_locales)]
     
-    # UNCAPPED GROWTH CALCULATION
+    # RAW GROWTH (Uncapped)
     site_growth_val = 0.0
     if not df_q_filtered.empty:
         site_weekly = df_q_filtered.groupby('Audit Creation Period Week')['audit_created_units'].sum().reset_index()
@@ -62,15 +65,17 @@ if merc_file and qc_file:
             diffs = [(u[i] - u[i-1]) / u[i-1] for i in range(1, len(u)) if u[i-1] > 0]
             site_growth_val = np.mean(diffs) if diffs else 0.0
 
-    st.sidebar.metric(label="📈 Estimated Raw Growth", value=f"{site_growth_val * 100:.2f}%")
+    st.sidebar.metric(label="📈 Avg Weekly Growth (Uncapped)", value=f"{site_growth_val * 100:.2f}%")
     
-    # 3. ANALYSIS TABS
-    tab1, tab2 = st.tabs(["📊 Historical Audit Data", "🚀 4-Week Prediction Forecast"])
+    # 3. TABS
+    tab1, tab2 = st.tabs(["📊 Weekly Historical Performance", "🚀 4-Week Staffing Forecast"])
 
-    num_weeks = len(df_q['Audit Creation Period Week'].unique())
+    # Determine unique weeks to get true average
+    unique_weeks_list = sorted(df_q['Audit Creation Period Week'].unique())
+    num_weeks = len(unique_weeks_list) if len(unique_weeks_list) > 0 else 1
 
     with tab1:
-        st.subheader("Historical Average Weekly Performance")
+        st.subheader("Historical Weekly Averages")
         
         hist_results = []
         for loc in sorted(site_locales):
@@ -79,19 +84,19 @@ if merc_file and qc_file:
             
             if q_loc.empty: continue
             
-            # Correct Sampling % Calculation
+            # Correct Sampling %: Audited / Total Production
             total_prod = q_loc['production_created_units'].sum()
             total_audit = q_loc['audit_created_units'].sum()
             sampling_pct = (total_audit / total_prod * 100) if total_prod > 0 else 0
             
-            # Trimmed AHT
-            aht_series = m_loc['Raw_AHT'].dropna()
+            # Trimmed AHT (Exclude Outliers)
+            aht_series = m_loc['Calc_AHT'].dropna()
             cleaned_aht = aht_series[aht_series <= aht_series.quantile(0.95)].mean() if not aht_series.empty else 0
             
             hist_results.append({
                 "Locale": loc,
-                "Avg Weekly Audit Vol": int(total_audit / num_weeks),
-                "Avg Weekly Prod Vol": int(total_prod / num_weeks),
+                "Avg Weekly Audit (T2)": int(total_audit / num_weeks),
+                "Avg Weekly Prod (T1)": int(total_prod / num_weeks),
                 "Sampling %": f"{sampling_pct:.2f}%",
                 "Cleaned AHT (s)": f"{cleaned_aht:.1f}"
             })
@@ -99,9 +104,9 @@ if merc_file and qc_file:
         st.dataframe(pd.DataFrame(hist_results), use_container_width=True, hide_index=True)
 
     with tab2:
-        st.subheader("Next 4 Weeks Capacity Prediction")
+        st.subheader("Headcount Forecast (Next 4 Weeks)")
         
-        # Build Week Range Headers (Mon-Fri)
+        # Date Headers (Mon-Fri)
         forecast_headers = []
         for i in range(1, 5):
             start = current_monday + timedelta(weeks=i)
@@ -115,13 +120,15 @@ if merc_file and qc_file:
             
             if q_loc.empty: continue
             
+            # Baseline Audit Volume per week
             base_audit_vol = q_loc['audit_created_units'].sum() / num_weeks
-            aht_series = m_loc['Raw_AHT'].dropna()
+            
+            aht_series = m_loc['Calc_AHT'].dropna()
             cleaned_aht = aht_series[aht_series <= aht_series.quantile(0.95)].mean() if not aht_series.empty else 0
             
             row = {"Locale": loc}
             for i in range(1, 5):
-                # Apply Uncapped Growth per Week
+                # Apply growth compoundly over weeks
                 pred_vol = base_audit_vol * (1 + (site_growth_val * i))
                 req_hours = (pred_vol * cleaned_aht) / 3600
                 hc_needed = req_hours / (prod_hours * 5)
@@ -131,7 +138,7 @@ if merc_file and qc_file:
             forecast_table.append(row)
 
         st.dataframe(pd.DataFrame(forecast_table), use_container_width=True, hide_index=True)
-        st.info(f"💡 Predictions are based on a baseline growth rate of **{site_growth_val*100:.2f}%** per week.")
+        st.warning(f"Note: Forecast assumes a **{site_growth_val*100:.2f}%** weekly growth in Audit volume.")
 
 else:
-    st.info("Please upload both CSV files to generate the planner.")
+    st.info("Please upload both files to generate the capacity report.")
