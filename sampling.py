@@ -9,7 +9,7 @@ st.set_page_config(page_title="Strategic Capacity Planner", layout="wide")
 # --- UI THEME ---
 st.markdown("""
     <style>
-    .stApp, [data-testid="stSidebar"] { background-color: #f8fafc !important; }
+    .stApp { background-color: #f8fafc !important; }
     div[data-testid="metric-container"] {
         background-color: #ffffff; border: 1px solid #e2e8f0;
         padding: 20px; border-radius: 12px; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.05);
@@ -28,7 +28,7 @@ merc_file = st.sidebar.file_uploader("Upload Mercury Metrics (AHT)", type="csv")
 qc_file = st.sidebar.file_uploader("Upload Quality Central (Volume)", type="csv")
 
 # NEW: Ghost Task Toggle
-hide_ghosts = st.sidebar.toggle("🚫 Hide Inactive (Ghost) Tasks", value=True, help="Removes tasks not seen in the last 2 weeks from all calculations.")
+hide_ghosts = st.sidebar.toggle("🚫 Hide Inactive (Ghost) Tasks", value=True)
 
 qas_per_site = st.sidebar.number_input("Current Team 2 Headcount", min_value=0.1, value=10.0)
 prod_hours = st.sidebar.slider("Daily Productive Hours", 5.0, 9.0, 7.5)
@@ -48,41 +48,32 @@ if merc_file and qc_file:
             if d[col].dtype == 'object':
                 d[col] = d[col].astype(str).str.strip()
 
-    # AHT Calculation
+    # 2. CALC AHT (Mercury)
     df_m['Calc_AHT'] = 3600 * (pd.to_numeric(df_m['Processed Hours'], errors='coerce').fillna(0) + 
                                pd.to_numeric(df_m['Manual Skip Hours'], errors='coerce').fillna(0)) / \
                                pd.to_numeric(df_m['Processed Units'], errors='coerce').replace(0, np.nan)
 
-    # 2. DEDUPLICATION (Batch Level)
-    batch_cols = ['execution_batch_id', 'workflow_name', 'locale', 'Audit Creation Period Week']
-    df_q_dedup = df_q.groupby(batch_cols).agg({
-        'audit_created_units': 'first',
-        'production_created_units': 'first'
-    }).reset_index()
-
-    # 3. IDENTIFY ACTIVE VS GHOST
-    all_weeks = sorted(df_q_dedup['Audit Creation Period Week'].unique(), reverse=True)
+    # 3. IDENTIFY ACTIVE TASKS (Last 2 weeks in QC)
+    all_weeks = sorted(df_q['Audit Creation Period Week'].unique(), reverse=True)
     recent_2_weeks = all_weeks[:2]
-    
-    active_wf = df_q_dedup[df_q_dedup['Audit Creation Period Week'].isin(recent_2_weeks)]['workflow_name'].unique()
-    active_loc = df_q_dedup[df_q_dedup['Audit Creation Period Week'].isin(recent_2_weeks)]['locale'].unique()
+    active_wf = df_q[df_q['Audit Creation Period Week'].isin(recent_2_weeks)]['workflow_name'].unique()
 
     # 4. SITE FILTERING
     all_sites = sorted(df_m['Column-1:Site'].unique())
-    selected_sites = st.sidebar.multiselect("Filter Site:", all_sites, default=all_sites)
-    site_locales = df_m[df_m['Column-1:Site'].isin(selected_sites)]['Column-2:Locale'].unique()
+    selected_sites = st.sidebar.multiselect("Filter Site:", all_sites, default=['CBG'] if 'CBG' in all_sites else all_sites)
     
-    f_q = df_q_dedup[df_q_dedup['locale'].isin(site_locales)]
     f_m = df_m[df_m['Column-1:Site'].isin(selected_sites)]
+    site_locales = f_m['Column-2:Locale'].unique()
+    f_q = df_q[df_q['locale'].isin(site_locales)]
 
-    # 5. HARD GHOST FILTER (Applied to the whole engine if toggled)
-    if hide_ghosts:
-        f_q = f_q[f_q['workflow_name'].isin(active_wf) & f_q['locale'].isin(active_loc)]
+    # 5. DEDUPLICATION (Batch Level)
+    batch_cols = ['execution_batch_id', 'workflow_name', 'locale', 'Audit Creation Period Week']
+    df_q_dedup = f_q.groupby(batch_cols).agg({'audit_created_units': 'first', 'production_created_units': 'first'}).reset_index()
 
     # 6. GROWTH TREND
     site_growth_val = 0.0
-    if not f_q.empty:
-        weekly_sum = f_q.groupby('Audit Creation Period Week')['audit_created_units'].sum().sort_index()
+    if not df_q_dedup.empty:
+        weekly_sum = df_q_dedup.groupby('Audit Creation Period Week')['audit_created_units'].sum().sort_index()
         u = weekly_sum.values
         if len(u) > 1:
             diffs = [(u[i] - u[i-1]) / u[i-1] for i in range(1, len(u)) if u[i-1] > 0]
@@ -90,76 +81,74 @@ if merc_file and qc_file:
 
     st.sidebar.metric(label="📈 Overall Growth Rate", value=f"{site_growth_val * 100:.2f}%")
 
-    # 7. BASELINE (Avg of last 4 weeks)
-    num_weeks = 4
-    recent_4_weeks = all_weeks[:4]
-    df_q_baseline = f_q[f_q['Audit Creation Period Week'].isin(recent_4_weeks)]
-    
-    wf_agg = df_q_baseline.groupby('workflow_name').agg({'audit_created_units':'sum', 'production_created_units':'sum'}).reset_index()
-    loc_agg = df_q_baseline.groupby('locale').agg({'audit_created_units':'sum', 'production_created_units':'sum'}).reset_index()
+    # 7. MERGE PERFORMANCE (Mercury) WITH VOLUME (QC)
+    # Group Mercury tasks first
+    merc_grouped = f_m.groupby(['Column-4:Transformation Type', 'Column-2:Locale']).agg({
+        'Calc_AHT': lambda x: x[x <= x.quantile(0.95)].mean()
+    }).reset_index()
 
-    def get_trimmed_aht(series):
-        clean = series.dropna()
-        return clean[clean <= clean.quantile(0.95)].mean() if not clean.empty else 0
+    # Group QC baseline (Avg of last 4 weeks)
+    qc_baseline = df_q_dedup[df_q_dedup['Audit Creation Period Week'].isin(all_weeks[:4])]
+    qc_agg = qc_baseline.groupby(['workflow_name', 'locale']).agg({
+        'audit_created_units': 'sum',
+        'production_created_units': 'sum'
+    }).reset_index()
 
-    def color_gap(val):
-        color = 'red' if float(val) < 0 else 'green'
-        return f'color: {color}; font-weight: bold'
+    # Merge
+    final_df = pd.merge(
+        merc_grouped, 
+        qc_agg, 
+        left_on=['Column-4:Transformation Type', 'Column-2:Locale'], 
+        right_on=['workflow_name', 'locale'], 
+        how='inner' # Only show tasks that exist in both files
+    )
+
+    # Apply Ghost Filter Toggle
+    if hide_ghosts:
+        final_df = final_df[final_df['Column-4:Transformation Type'].isin(active_wf)]
 
     # --- TABS ---
     tab1, tab2 = st.tabs(["📊 Historical Audit Data", "🚀 Future Forecast Explorer"])
 
     with tab1:
-        st.subheader("Historical Weekly Average")
-        c1, c2 = st.columns(2)
-        with c1:
-            st.markdown("### 🛠️ Breakdown by Workflow")
-            wf_h = []
-            for _, row in wf_agg.iterrows():
-                aht = get_trimmed_aht(f_m[f_m['Column-4:Transformation Type'] == row['workflow_name']]['Calc_AHT'])
-                if aht > 0:
-                    s_pct = (row['audit_created_units']/row['production_created_units']*100) if row['production_created_units']>0 else 0
-                    wf_h.append({"Workflow Name": row['workflow_name'], "Avg Weekly Tasks": int(row['audit_created_units']/num_weeks), "Sampling %": f"{s_pct:.1f}%", "Cleaned AHT (s)": f"{aht:.1f}"})
-            st.dataframe(pd.DataFrame(wf_h), use_container_width=True, hide_index=True)
-        with c2:
-            st.markdown("### 📍 Breakdown by Locale")
-            loc_h = []
-            for _, row in loc_agg.iterrows():
-                aht = get_trimmed_aht(f_m[f_m['Column-2:Locale'] == row['locale']]['Calc_AHT'])
-                if aht > 0:
-                    s_pct = (row['audit_created_units']/row['production_created_units']*100) if row['production_created_units']>0 else 0
-                    loc_h.append({"Locale": row['locale'], "Avg Weekly Tasks": int(row['audit_created_units']/num_weeks), "Sampling %": f"{s_pct:.1f}%", "Cleaned AHT (s)": f"{aht:.1f}"})
-            st.dataframe(pd.DataFrame(loc_h), use_container_width=True, hide_index=True)
+        st.subheader("Historical Performance Match")
+        hist_table = []
+        for _, row in final_df.iterrows():
+            avg_weekly = row['audit_created_units'] / 4
+            s_pct = (row['audit_created_units'] / row['production_created_units'] * 100) if row['production_created_units'] > 0 else 0
+            hist_table.append({
+                "Transformation Type": row['Column-4:Transformation Type'],
+                "Locale": row['Column-2:Locale'],
+                "Avg Weekly Tasks": int(avg_weekly),
+                "Sampling %": f"{s_pct:.1f}%",
+                "AHT (Secs)": f"{row['Calc_AHT']:.1f}"
+            })
+        st.dataframe(pd.DataFrame(hist_table), use_container_width=True, hide_index=True)
 
     with tab2:
-        st.subheader("Team 2 Task Forecast")
-        st.caption(f"📅 **Current Date:** {datetime.now().strftime('%d %b %Y')}")
-        week_options = [f"Week {i} ({(current_monday + timedelta(weeks=i)).strftime('%d %b')} - {(current_monday + timedelta(weeks=i, days=4)).strftime('%d %b')})" for i in range(1, 5)]
+        st.subheader("Forecast vs Staffing Capacity")
+        week_options = [f"Week {i}" for i in range(1, 5)]
         selected_week = st.selectbox("Select Prediction Week:", week_options)
         week_idx = week_options.index(selected_week) + 1
 
-        f_col1, f_col2 = st.columns(2)
-        with f_col1:
-            st.markdown(f"### 🛠️ Workflow Forecast")
-            wf_f = []
-            for _, row in wf_agg.iterrows():
-                aht = get_trimmed_aht(f_m[f_m['Column-4:Transformation Type'] == row['workflow_name']]['Calc_AHT'])
-                if aht > 0:
-                    pred = (row['audit_created_units']/num_weeks) * (1 + (site_growth_val * week_idx))
-                    hc = (pred * aht) / (3600 * prod_hours * 5)
-                    wf_f.append({"Workflow Name": row['workflow_name'], "Expected Tasks": int(pred), "HC Needed": f"{hc:.2f}", "Staffing Gap": f"{qas_per_site - hc:.2f}"})
-            if wf_f:
-                st.dataframe(pd.DataFrame(wf_f).style.map(color_gap, subset=['Staffing Gap']), use_container_width=True, hide_index=True)
-        with f_col2:
-            st.markdown(f"### 📍 Locale Forecast")
-            loc_f = []
-            for _, row in loc_agg.iterrows():
-                aht = get_trimmed_aht(f_m[f_m['Column-2:Locale'] == row['locale']]['Calc_AHT'])
-                if aht > 0:
-                    pred = (row['audit_created_units']/num_weeks) * (1 + (site_growth_val * week_idx))
-                    hc = (pred * aht) / (3600 * prod_hours * 5)
-                    loc_f.append({"Locale": row['locale'], "Expected Tasks": int(pred), "HC Needed": f"{hc:.2f}", "Staffing Gap": f"{qas_per_site - hc:.2f}"})
-            if loc_f:
-                st.dataframe(pd.DataFrame(loc_f).style.map(color_gap, subset=['Staffing Gap']), use_container_width=True, hide_index=True)
+        f_table = []
+        for _, row in final_df.iterrows():
+            avg_weekly = row['audit_created_units'] / 4
+            pred_tasks = avg_weekly * (1 + (site_growth_val * week_idx))
+            hc_req = (pred_tasks * row['Calc_AHT']) / (3600 * prod_hours * 5)
+            
+            f_table.append({
+                "Transformation Type": row['Column-4:Transformation Type'],
+                "Locale": row['Column-2:Locale'],
+                "Expected Tasks": int(pred_tasks),
+                "HC Needed": f"{hc_req:.2f}",
+                "Staffing Gap": f"{qas_per_site - hc_req:.2f}"
+            })
+        
+        if f_table:
+            df_f = pd.DataFrame(f_table)
+            def color_gap(val):
+                return 'color: red; font-weight: bold' if float(val) < 0 else 'color: green; font-weight: bold'
+            st.dataframe(df_f.style.map(color_gap, subset=['Staffing Gap']), use_container_width=True, hide_index=True)
 else:
-    st.info("Upload your Mercury and QC files. Use the 'Hide Inactive Tasks' toggle in the sidebar to purge January-only tasks.")
+    st.info("Upload files to verify the CBG en_US task list.")
