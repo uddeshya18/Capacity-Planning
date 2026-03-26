@@ -14,6 +14,7 @@ st.markdown("""
         background-color: #ffffff; border: 1px solid #e2e8f0;
         padding: 20px; border-radius: 12px;
     }
+    .date-header { font-size: 1.2rem; font-weight: 600; color: #1e293b; margin-bottom: 10px; }
     </style>
     """, unsafe_allow_html=True)
 
@@ -32,6 +33,16 @@ hide_ghosts = st.sidebar.toggle("🚫 Hide Ghosts (AHT=0 & HC=0)", value=True)
 qas_per_site = st.sidebar.number_input("Current Team 2 Headcount", min_value=0.1, value=10.0)
 prod_hours = st.sidebar.slider("Daily Productive Hours", 5.0, 9.0, 7.5)
 
+# --- DATE HELPER LOGIC ---
+today = datetime.now()
+# Find the upcoming Monday
+next_monday = today + timedelta(days=(7 - today.weekday()) % 7)
+
+def get_week_range(weeks_ahead):
+    start = next_monday + timedelta(weeks=weeks_ahead-1)
+    end = start + timedelta(days=4) # Friday
+    return f"{start.strftime('%b %d')} - {end.strftime('%b %d, %Y')}"
+
 if merc_file and qc_file:
     # 1. LOAD & NORMALIZE
     df_m = pd.read_csv(merc_file)
@@ -47,13 +58,10 @@ if merc_file and qc_file:
     selected_site = st.sidebar.selectbox("Select Site:", all_sites, index=all_sites.index('CBG') if 'CBG' in all_sites else 0)
     site_locales = df_m[df_m['Column-1:Site'] == selected_site]['Column-2:Locale'].unique()
     
-    # Base Data (Before Ghost Filtering)
     f_m_base = df_m[df_m['Column-1:Site'] == selected_site]
     f_q_base = df_q[df_q['locale'].isin(site_locales)]
 
-    # 3. CALCULATE STABLE GROWTH (CRITICAL FIX)
-    # We calculate growth on the TOTAL site data BEFORE hiding ghosts.
-    # This keeps the growth at 5.29% instead of spiking to 32%.
+    # 3. STABLE GROWTH (Locked to prevent spikes)
     batch_cols = ['execution_batch_id', 'workflow_name', 'locale', 'Audit Creation Period Week']
     df_q_all_dedup = f_q_base.groupby(batch_cols).agg({'audit_created_units': 'first'}).reset_index()
 
@@ -65,9 +73,8 @@ if merc_file and qc_file:
         diffs = [(u[i] - u[i-1]) / u[i-1] for i in range(1, len(u)) if u[i-1] > 0]
         return np.mean(diffs)
 
-    # This rate remains the same regardless of the toggle
     stable_site_growth = get_stable_growth(df_q_all_dedup)
-    st.sidebar.metric(label=f"📈 Stable Site Growth ({selected_site})", value=f"{stable_site_growth * 100:.2f}%")
+    st.sidebar.metric(label=f"📈 Stable Site Growth", value=f"{stable_site_growth * 100:.2f}%")
 
     # 4. GHOST DETECTION
     f_m_base['Processed Units'] = pd.to_numeric(f_m_base['Processed Units'], errors='coerce').fillna(0)
@@ -77,21 +84,9 @@ if merc_file and qc_file:
                                    f_m_base['Processed Units'].replace(0, np.nan)
     f_m_base['Calc_AHT'] = f_m_base['Calc_AHT'].fillna(0)
 
-    # Active = AHT > 0
     real_workflows = f_m_base[f_m_base['Calc_AHT'] > 0]['Column-4:Transformation Type'].unique()
 
-    # 5. TASK INVENTORY AUDIT
-    total_tasks = f_q_base['workflow_name'].nunique()
-    active_tasks = len([x for x in f_q_base['workflow_name'].unique() if x in real_workflows])
-    ghosts_found = total_tasks - active_tasks
-
-    with st.sidebar.expander("📝 Site Data Summary", expanded=True):
-        st.write(f"**Total Tasks:** {total_tasks}")
-        if hide_ghosts:
-            st.success(f"**Showing Active:** {active_tasks}")
-            st.error(f"**Hidden Ghosts:** {ghosts_found}")
-
-    # 6. APPLY FILTERING TO DATA LISTS
+    # 5. FILTERING
     if hide_ghosts:
         f_q = f_q_base[f_q_base['workflow_name'].isin(real_workflows)]
         f_m = f_m_base[f_m_base['Column-4:Transformation Type'].isin(real_workflows)]
@@ -99,7 +94,7 @@ if merc_file and qc_file:
         f_q = f_q_base
         f_m = f_m_base
 
-    # 7. BASELINE PREP
+    # 6. BASELINE AGGREGATION
     df_q_final_dedup = f_q.groupby(batch_cols).agg({'audit_created_units': 'first', 'production_created_units': 'first'}).reset_index()
     num_weeks = 4
     all_weeks = sorted(df_q['Audit Creation Period Week'].unique(), reverse=True)
@@ -111,8 +106,7 @@ if merc_file and qc_file:
         return clean[clean <= clean.quantile(0.95)].mean() if not clean.empty else 0
 
     def color_gap(val):
-        try:
-            return 'color: red; font-weight: bold' if float(val) < 0 else 'color: green; font-weight: bold'
+        try: return 'color: red; font-weight: bold' if float(val) < 0 else 'color: green; font-weight: bold'
         except: return ''
 
     # --- TABS ---
@@ -120,7 +114,9 @@ if merc_file and qc_file:
 
     with tab1:
         st.subheader(f"Historical Performance: {selected_site}")
-        # LOCALE TABLE
+        st.markdown(f"<div class='date-header'>Today's Date: {today.strftime('%A, %B %d, %Y')}</div>", unsafe_allow_html=True)
+        
+        # LOCALES
         loc_agg = qc_baseline.groupby('locale').agg({'audit_created_units':'sum', 'production_created_units':'sum'}).reset_index()
         loc_h = []
         for _, row in loc_agg.iterrows():
@@ -131,7 +127,7 @@ if merc_file and qc_file:
 
         st.divider()
 
-        # WORKFLOW TABLE
+        # WORKFLOWS
         wf_agg = qc_baseline.groupby('workflow_name').agg({'audit_created_units':'sum', 'production_created_units':'sum'}).reset_index()
         wf_h = []
         for _, row in wf_agg.iterrows():
@@ -142,16 +138,19 @@ if merc_file and qc_file:
 
     with tab2:
         st.subheader(f"Capacity Forecast: {selected_site}")
-        week_options = ["Week 1", "Week 2", "Week 3", "Week 4"]
-        selected_week = st.selectbox("Select Prediction Week:", week_options)
-        week_idx = week_options.index(selected_week) + 1
+        
+        # DATE RANGE SELECTOR
+        week_labels = [f"Week {i} ({get_week_range(i)})" for i in range(1, 5)]
+        selected_week_label = st.selectbox("Select Target Forecast Week:", week_labels)
+        week_idx = week_labels.index(selected_week_label) + 1
 
-        # FORECASTS (Using the STABLE growth)
-        st.markdown("#### 📍 Locale Forecast")
+        st.info(f"💡 Forecast assumes a stable site growth of **{stable_site_growth*100:.2f}%** per week.")
+
+        # LOCALES FORECAST
+        st.markdown("#### 📍 Locale Prediction")
         loc_f = []
         for _, row in loc_agg.iterrows():
             aht = get_trimmed_aht(f_m[f_m['Column-2:Locale'] == row['locale']]['Calc_AHT'])
-            # Calculation uses the locked site growth
             pred = (row['audit_created_units']/num_weeks) * (1 + (stable_site_growth * week_idx))
             hc = (pred * aht) / (3600 * prod_hours * 5)
             loc_f.append({"Locale": row['locale'], "Expected Units": int(pred), "HC Needed": f"{hc:.2f}", "Staffing Gap": f"{qas_per_site - hc:.2f}"})
@@ -159,7 +158,8 @@ if merc_file and qc_file:
 
         st.divider()
 
-        st.markdown("#### 🛠️ Workflow Forecast")
+        # WORKFLOW FORECAST
+        st.markdown("#### 🛠️ Workflow Prediction")
         wf_f = []
         for _, row in wf_agg.iterrows():
             aht = get_trimmed_aht(f_m[f_m['Column-4:Transformation Type'] == row['workflow_name']]['Calc_AHT'])
@@ -168,4 +168,4 @@ if merc_file and qc_file:
             wf_f.append({"Workflow Name": row['workflow_name'], "Expected Units": int(pred), "HC Needed": f"{hc:.2f}", "Staffing Gap": f"{qas_per_site - hc:.2f}"})
         st.dataframe(pd.DataFrame(wf_f).style.applymap(color_gap, subset=['Staffing Gap']), use_container_width=True, hide_index=True)
 else:
-    st.info("Upload files. The Stable Growth logic prevents the 32% jump when hiding ghosts.")
+    st.info("Upload files to begin. Today's date is: " + today.strftime('%B %d, %Y'))
