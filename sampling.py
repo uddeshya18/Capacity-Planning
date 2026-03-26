@@ -37,47 +37,56 @@ def load_and_process():
             df_m = pd.read_csv(file_mercury)
             df_q = pd.read_csv(file_qc)
             
-            # CLEANUP: Remove leading/trailing spaces from all column names
+            # Clean column names (strip spaces)
             df_m.columns = df_m.columns.str.strip()
             df_q.columns = df_q.columns.str.strip()
 
-            # 1. Standardize Mercury (Total Site Production)
-            # We keep Mercury names as they are (Case Sensitive)
-            df_m['Processed Units'] = pd.to_numeric(df_m['Processed Units'], errors='coerce').fillna(0)
-            df_m['Processed Hours'] = pd.to_numeric(df_m['Processed Hours'], errors='coerce').fillna(0)
-            df_m['Manual Skip Hours'] = pd.to_numeric(df_m['Manual Skip Hours'], errors='coerce').fillna(0)
+            # 1. Map Mercury Columns (Site Production)
+            # site_col = 'Column-1:Site', locale_col = 'Column-2:Locale', workflow_col = 'Column-4:Transformation Type'
+            m_units_col = 'Processed Units'
+            m_hours_col = 'Processed Hours'
+            m_skip_col = 'Manual Skip Hours'
+            
+            df_m[m_units_col] = pd.to_numeric(df_m[m_units_col], errors='coerce').fillna(0)
+            df_m[m_hours_col] = pd.to_numeric(df_m[m_hours_col], errors='coerce').fillna(0)
+            df_m[m_skip_col] = pd.to_numeric(df_m[m_skip_col], errors='coerce').fillna(0)
             
             # AHT Formula: 3600 * (Hours + Skip Hours) / Units
-            df_m['Calc_AHT'] = 3600 * (df_m['Processed Hours'] + df_m['Manual Skip Hours']) / df_m['Processed Units'].replace(0, np.nan)
+            df_m['Calc_AHT'] = 3600 * (df_m[m_hours_col] + df_m[m_skip_col]) / df_m[m_units_col].replace(0, np.nan)
             df_m['Calc_AHT'] = df_m['Calc_AHT'].fillna(0)
             
-            # 2. Standardize QC (Audited Units)
-            # We use lowercase mapping for QC to be safe
-            df_q.columns = df_q.columns.str.lower()
-            df_q['processed_units'] = pd.to_numeric(df_q['processed_units'], errors='coerce').fillna(0)
-            df_q['week'] = pd.to_datetime(df_q['week'], errors='coerce')
+            # 2. Map QC Columns (Audited Units)
+            # week_col = 'Audit Creation Period Week', audited_units = 'audit_completed_units'
+            q_workflow_col = 'workflow_name'
+            q_locale_col = 'locale'
+            q_units_col = 'audit_completed_units'
+            q_week_col = 'Audit Creation Period Week'
+
+            # Standardizing internal names
+            df_q['processed_units'] = pd.to_numeric(df_q[q_units_col], errors='coerce').fillna(0)
+            df_q['week'] = pd.to_datetime(df_q[q_week_col], errors='coerce')
             
             # 3. Calculate Stable Growth (From QC Week-over-Week)
             weekly_trend = df_q.groupby('week')['processed_units'].sum().sort_index()
             growth_pct = weekly_trend.pct_change().mean()
             stable_growth = growth_pct if not (np.isnan(growth_pct) or np.isinf(growth_pct)) else 0.0529
             
-            # 4. Join Files for Sampling % and Mapping
-            m_agg = df_m.groupby(['Workflow Name', 'Column-2:Locale', 'Column-1:Site']).agg({
+            # 4. Join Files for Sampling %
+            m_agg = df_m.groupby(['Column-4:Transformation Type', 'Column-2:Locale', 'Column-1:Site']).agg({
                 'Processed Units': 'sum',
                 'Calc_AHT': 'mean' 
             }).reset_index()
             
-            q_agg = df_q.groupby(['workflow_name', 'locale']).agg({
+            q_agg = df_q.groupby([q_workflow_col, q_locale_col]).agg({
                 'processed_units': 'mean' 
             }).reset_index()
             
-            # Merge: Match QC (lowercase) to Mercury (Standard Case)
+            # Merge: QC Workflow to Mercury Transformation Type
             master = pd.merge(
                 q_agg, 
                 m_agg, 
-                left_on=['workflow_name', 'locale'], 
-                right_on=['Workflow Name', 'Column-2:Locale'], 
+                left_on=[q_workflow_col, q_locale_col], 
+                right_on=['Column-4:Transformation Type', 'Column-2:Locale'], 
                 how='left'
             )
             
@@ -151,4 +160,4 @@ if master_data is not None:
         )
 
 else:
-    st.info("Please upload both Mercury Metrics and Quality Central CSV files to begin. Ensure your QC file contains columns for 'processed_units', 'week', 'workflow_name', and 'locale'.")
+    st.info("Please upload both Mercury Metrics and Quality Central CSV files to begin.")
