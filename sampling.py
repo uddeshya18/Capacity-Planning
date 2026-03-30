@@ -42,8 +42,19 @@ def get_week_range(weeks_ahead):
     end = start + timedelta(days=4)
     return f"{start.strftime('%b %d')} - {end.strftime('%b %d, %Y')}"
 
+# --- STYLING HELPER ---
+def style_staffing_gap(v):
+    """Stronger color coding for the Staffing Gap"""
+    try:
+        val = float(v)
+        if val < 0:
+            return 'color: #e11d48; font-weight: bold; background-color: #fff1f2;' # Red
+        else:
+            return 'color: #166534; font-weight: bold; background-color: #f0fdf4;' # Green
+    except:
+        return ''
+
 if merc_file and qc_file:
-    # 1. LOAD & NORMALIZE
     df_m = pd.read_csv(merc_file)
     df_q = pd.read_csv(qc_file)
 
@@ -52,19 +63,19 @@ if merc_file and qc_file:
             if d[col].dtype == 'object':
                 d[col] = d[col].astype(str).str.strip()
 
-    # 2. MULTI-SITE SELECTION
+    # 2. SITE SELECTION
     all_sites = sorted(df_m['Column-1:Site'].unique())
     selected_sites = st.sidebar.multiselect("Select Sites:", options=all_sites, default=[all_sites[0]])
 
     if not selected_sites:
-        st.warning("Please select at least one site from the sidebar.")
+        st.warning("Please select at least one site.")
         st.stop()
     
     site_locales = df_m[df_m['Column-1:Site'].isin(selected_sites)]['Column-2:Locale'].unique()
     f_m_base = df_m[df_m['Column-1:Site'].isin(selected_sites)]
     f_q_base = df_q[df_q['locale'].isin(site_locales)]
 
-    # 3. STABLE GROWTH (Aggregated at Site Group Level)
+    # 3. GROWTH CALC
     batch_cols = ['execution_batch_id', 'workflow_name', 'locale', 'Audit Creation Period Week']
     if 'demand_category' in f_q_base.columns:
         batch_cols.append('demand_category')
@@ -82,26 +93,17 @@ if merc_file and qc_file:
     stable_site_growth = get_stable_growth(df_q_all_dedup)
     st.sidebar.metric(label="📈 Group Growth Rate", value=f"{stable_site_growth * 100:.2f}%")
 
-    # 4. PERFORMANCE & FILTERING
+    # 4. AHT CALC
     f_m_base['Processed Units'] = pd.to_numeric(f_m_base['Processed Units'], errors='coerce').fillna(0)
     f_m_base['Processed Hours'] = pd.to_numeric(f_m_base['Processed Hours'], errors='coerce').fillna(0)
-    
-    # Calculate AHT including Manual Skips
-    f_m_base['Calc_AHT'] = 3600 * (f_m_base['Processed Hours'] + 
-                                   pd.to_numeric(f_m_base['Manual Skip Hours'], errors='coerce').fillna(0)) / \
-                                   f_m_base['Processed Units'].replace(0, np.nan)
+    f_m_base['Calc_AHT'] = 3600 * (f_m_base['Processed Hours'] + pd.to_numeric(f_m_base['Manual Skip Hours'], errors='coerce').fillna(0)) / f_m_base['Processed Units'].replace(0, np.nan)
     f_m_base['Calc_AHT'] = f_m_base['Calc_AHT'].fillna(0)
 
     real_workflows = f_m_base[f_m_base['Calc_AHT'] > 0]['Column-4:Transformation Type'].unique()
+    f_q = f_q_base[f_q_base['workflow_name'].isin(real_workflows)] if hide_ghosts else f_q_base
+    f_m = f_m_base[f_m_base['Column-4:Transformation Type'].isin(real_workflows)] if hide_ghosts else f_m_base
 
-    if hide_ghosts:
-        f_q = f_q_base[f_q_base['workflow_name'].isin(real_workflows)]
-        f_m = f_m_base[f_m_base['Column-4:Transformation Type'].isin(real_workflows)]
-    else:
-        f_q = f_q_base
-        f_m = f_m_base
-
-    # 5. BASELINE AGGREGATION
+    # 5. FORECAST LOGIC
     df_q_final_dedup = f_q.groupby(batch_cols).agg({'audit_created_units': 'first'}).reset_index()
     num_weeks = 4
     all_weeks = sorted(df_q['Audit Creation Period Week'].unique(), reverse=True)
@@ -110,36 +112,19 @@ if merc_file and qc_file:
 
     def get_trimmed_aht(series):
         clean = series.dropna()
-        # 95th Percentile Trim logic
         return clean[clean <= clean.quantile(0.95)].mean() if not clean.empty else 0
-
-    def color_gap(val):
-        try: return 'color: red; font-weight: bold' if float(val) < 0 else 'color: green; font-weight: bold'
-        except: return ''
 
     # --- TABS ---
     tab1, tab2, tab3 = st.tabs(["📊 Historical Data", "🚀 Future Forecast", "📂 Category View"])
 
     with tab1:
         st.subheader(f"Historical Snapshot: {', '.join(selected_sites)}")
-        st.markdown(f"<p class='date-header'>Snapshot Date: {today.strftime('%b %d, %Y')}</p>", unsafe_allow_html=True)
-        
-        # Locale Table
         loc_agg = qc_baseline.groupby('locale').agg({'audit_created_units':'sum'}).reset_index()
         loc_h = []
         for _, row in loc_agg.iterrows():
             aht = get_trimmed_aht(f_m[f_m['Column-2:Locale'] == row['locale']]['Calc_AHT'])
-            loc_h.append({"Locale": row['locale'], "Avg Weekly Units": int(row['audit_created_units']/num_weeks), "AHT (Secs)": f"{aht:.1f}"})
+            loc_h.append({"Locale": row['locale'], "Avg Weekly Units": int(row['audit_created_units']/num_weeks), "AHT (Secs)": round(aht, 1)})
         st.dataframe(pd.DataFrame(loc_h), use_container_width=True, hide_index=True)
-
-        st.divider()
-        # Workflow Table
-        wf_agg = qc_baseline.groupby('workflow_name').agg({'audit_created_units':'sum'}).reset_index()
-        wf_h = []
-        for _, row in wf_agg.iterrows():
-            aht = get_trimmed_aht(f_m[f_m['Column-4:Transformation Type'] == row['workflow_name']]['Calc_AHT'])
-            wf_h.append({"Workflow Name": row['workflow_name'], "Avg Weekly Units": int(row['audit_created_units']/num_weeks), "AHT (Secs)": f"{aht:.1f}"})
-        st.dataframe(pd.DataFrame(wf_h), use_container_width=True, hide_index=True)
 
     with tab2:
         st.subheader(f"Capacity Forecast: {', '.join(selected_sites)}")
@@ -147,73 +132,51 @@ if merc_file and qc_file:
         selected_week_label = st.selectbox("Select Target Week:", week_labels)
         week_idx = week_labels.index(selected_week_label) + 1
 
-        # LOCALE PREDICTION
-        st.markdown("#### 📍 Locale Prediction")
-        loc_f = []
-        for _, row in loc_agg.iterrows():
-            aht = get_trimmed_aht(f_m[f_m['Column-2:Locale'] == row['locale']]['Calc_AHT'])
-            pred = (row['audit_created_units']/num_weeks) * (1 + (stable_site_growth * week_idx))
-            hc = (pred * aht) / (3600 * prod_hours * 5)
-            if hc > 0 or not hide_ghosts:
-                loc_f.append({"Locale": row['locale'], "Expected Units": int(pred), "HC Needed": f"{hc:.2f}", "Staffing Gap": f"{qas_per_site - hc:.2f}"})
-        st.dataframe(pd.DataFrame(loc_f).style.applymap(color_gap, subset=['Staffing Gap']), use_container_width=True, hide_index=True)
-
-        st.divider()
-        # WORKFLOW PREDICTION
-        st.markdown("#### 🛠️ Workflow Prediction")
+        wf_agg = qc_baseline.groupby('workflow_name').agg({'audit_created_units':'sum'}).reset_index()
         wf_f = []
         for _, row in wf_agg.iterrows():
             aht = get_trimmed_aht(f_m[f_m['Column-4:Transformation Type'] == row['workflow_name']]['Calc_AHT'])
             pred = (row['audit_created_units']/num_weeks) * (1 + (stable_site_growth * week_idx))
             hc = (pred * aht) / (3600 * prod_hours * 5)
-            if hc > 0 or not hide_ghosts:
-                wf_f.append({"Workflow Name": row['workflow_name'], "Expected Units": int(pred), "HC Needed": f"{hc:.2f}", "Staffing Gap": f"{qas_per_site - hc:.2f}"})
-        st.dataframe(pd.DataFrame(wf_f).style.applymap(color_gap, subset=['Staffing Gap']), use_container_width=True, hide_index=True)
+            wf_f.append({
+                "Workflow Name": row['workflow_name'], 
+                "Expected Units": int(pred), 
+                "HC Needed": round(hc, 2), 
+                "Staffing Gap": round(qas_per_site - hc, 2)
+            })
+        
+        df_wf_f = pd.DataFrame(wf_f)
+        st.dataframe(df_wf_f.style.map(style_staffing_gap, subset=['Staffing Gap']), use_container_width=True, hide_index=True)
 
     with tab3:
-        st.subheader("📂 Strategic Demand Overview")
+        st.subheader("📂 Demand Category Analysis")
         actual_categories = ["Classic Alexa", "Nova", "Alexa+", "Other"]
         
         if 'demand_category' in qc_baseline.columns:
-            # Prepare hierarchical data
+            # 1. Visualization
             hier_data = qc_baseline.groupby(['demand_category', 'workflow_name']).agg({'audit_created_units':'sum'}).reset_index()
             hier_data = hier_data[hier_data['demand_category'].isin(actual_categories)]
-            
-            # Calculate projections for visualization
-            hier_data['Expected Tasks'] = ((hier_data['audit_created_units']/num_weeks) * (1 + (stable_site_growth * week_idx))).astype(int)
+            hier_data['Tasks Remaining'] = ((hier_data['audit_created_units']/num_weeks) * (1 + (stable_site_growth * week_idx))).astype(int)
 
-            # 1. Hierarchical Visualization (Sunburst)
-            fig = px.sunburst(
+            fig = px.treemap(
                 hier_data,
                 path=['demand_category', 'workflow_name'],
-                values='Expected Tasks',
+                values='Tasks Remaining',
                 color='demand_category',
-                title="Workflow Distribution by Demand Category",
-                color_discrete_map={"Classic Alexa": "#636EFA", "Nova": "#EF553B", "Alexa+": "#00CC96", "Other": "#AB63FA"}
+                title="Workload Bifurcation (Click to Drill Down)",
+                color_discrete_map={"Classic Alexa": "#2563eb", "Nova": "#dc2626", "Alexa+": "#059669", "Other": "#7c3aed"}
             )
+            fig.update_traces(textinfo="label+value")
             st.plotly_chart(fig, use_container_width=True)
 
-            st.divider()
-            
-            # 2. Aggregated Category Table
-            st.markdown("#### 📊 Category Staffing Summary")
-            cat_agg = hier_data.groupby('demand_category').agg({'Expected Tasks':'sum'}).reset_index()
-            cat_results = []
-            for _, row in cat_agg.iterrows():
-                # Get Avg AHT for all workflows in this category
-                rel_wfs = hier_data[hier_data['demand_category'] == row['demand_category']]['workflow_name'].unique()
-                avg_aht = f_m[f_m['Column-4:Transformation Type'].isin(rel_wfs)]['Calc_AHT'].mean()
-                
-                hc = (row['Expected Tasks'] * avg_aht) / (3600 * prod_hours * 5)
-                cat_results.append({
-                    "Demand Category": row['demand_category'],
-                    "Expected Units": row['Expected Tasks'],
-                    "HC Needed": f"{hc:.2f}",
-                    "Staffing Gap": f"{qas_per_site - hc:.2f}"
-                })
-            st.dataframe(pd.DataFrame(cat_results).style.applymap(color_gap, subset=['Staffing Gap']), use_container_width=True, hide_index=True)
+            # 2. Detailed Table
+            st.markdown("#### 📊 Task Counts by Workflow")
+            st.dataframe(
+                hier_data[['demand_category', 'workflow_name', 'Tasks Remaining']].sort_values(['demand_category', 'Tasks Remaining'], ascending=[True, False]),
+                use_container_width=True, hide_index=True
+            )
         else:
-            st.info("The 'demand_category' column was not found in the Quality Central file.")
+            st.info("Demand Category column not detected.")
 
 else:
-    st.info("Upload Mercury and QC files to generate the capacity plan.")
+    st.info("Upload files to start.")
