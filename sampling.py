@@ -102,7 +102,7 @@ if merc_file and qc_file:
     f_q = f_q_base[f_q_base['workflow_name'].isin(real_workflows)] if hide_ghosts else f_q_base
     f_m = f_m_base[f_m_base['Column-4:Transformation Type'].isin(real_workflows)] if hide_ghosts else f_m_base
 
-    # 4. DATA AGGREGATION
+    # 4. BASELINE DATA
     df_q_final_dedup = f_q.groupby(batch_cols).agg({'audit_created_units': 'first'}).reset_index()
     num_weeks = 4
     all_weeks = sorted(df_q['Audit Creation Period Week'].unique(), reverse=True)
@@ -139,7 +139,7 @@ if merc_file and qc_file:
     with tab2:
         st.subheader("Future Capacity Projections")
         week_labels = [f"Week {i} ({get_week_range(i)})" for i in range(1, 5)]
-        selected_week_label = st.selectbox("Target Forecast Week:", week_labels)
+        selected_week_label = st.selectbox("Target Forecast Week:", week_labels, key="tab2_week")
         week_idx = week_labels.index(selected_week_label) + 1
 
         st.markdown("#### 📍 Locale Prediction")
@@ -163,29 +163,35 @@ if merc_file and qc_file:
 
     with tab3:
         st.subheader("📂 Strategic Demand Overview")
+        
+        # --- WEEK SELECTOR ADDED TO TAB 3 ---
+        week_labels_t3 = [f"Week {i} ({get_week_range(i)})" for i in range(1, 5)]
+        selected_week_t3 = st.selectbox("Select Forecast Week for Category View:", week_labels_t3, key="tab3_week")
+        week_idx_t3 = week_labels_t3.index(selected_week_t3) + 1
+        
         actual_categories = ["Classic Alexa", "Nova", "Alexa+", "Other"]
         
         if 'demand_category' in qc_baseline.columns:
             hier_data = qc_baseline.groupby(['demand_category', 'workflow_name']).agg({'audit_created_units':'sum'}).reset_index()
             hier_data = hier_data[hier_data['demand_category'].isin(actual_categories)]
-            hier_data['Tasks Remaining'] = ((hier_data['audit_created_units']/num_weeks) * (1 + (stable_site_growth * week_idx))).astype(int)
+            
+            # Recalculate 'Tasks Remaining' based on Tab 3's week selection
+            hier_data['Tasks Remaining'] = ((hier_data['audit_created_units']/num_weeks) * (1 + (stable_site_growth * week_idx_t3))).astype(int)
 
-            # --- COLOR BIFURCATION FIX ---
             fig = px.treemap(
                 hier_data,
                 path=[px.Constant("All Demand"), 'demand_category', 'workflow_name'],
                 values='Tasks Remaining',
-                color='demand_category', # Forces colors to separate by Category
+                color='demand_category',
                 color_discrete_map={
-                    "Classic Alexa": "#1E40AF", # Dark Blue
-                    "Nova": "#B91C1C",          # Strong Red
-                    "Alexa+": "#047857",        # Dark Green
-                    "Other": "#6D28D9"           # Deep Purple
+                    "Classic Alexa": "#1E40AF", 
+                    "Nova": "#B91C1C",          
+                    "Alexa+": "#047857",        
+                    "Other": "#6D28D9"           
                 },
-                title="Interactive Demand Bifurcation"
+                title=f"Demand Bifurcation for {selected_week_t3}"
             )
             
-            # White borders make the 'workflows' inside a category visible as separate blocks
             fig.update_traces(
                 textinfo="label+value",
                 marker=dict(line=dict(width=2, color='white'))
@@ -193,13 +199,13 @@ if merc_file and qc_file:
             
             st.plotly_chart(fig, use_container_width=True)
 
-            st.markdown("#### 📋 Detailed Remaining Task Count")
+            st.markdown(f"#### 📋 Detailed Breakdown for {selected_week_t3}")
             st.dataframe(
                 hier_data[['demand_category', 'workflow_name', 'Tasks Remaining']].sort_values(['demand_category', 'Tasks Remaining'], ascending=[True, False]),
                 use_container_width=True, hide_index=True
             )
         else:
-            st.info("Ensure your QC file contains a 'demand_category' column.")
+            st.info("Demand Category column not detected.")
 
 else:
-    st.info("Upload your Mercury and QC files to visualize the capacity plan.")
+    st.info("Upload Mercury and QC files to begin.")
