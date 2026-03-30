@@ -51,7 +51,7 @@ if merc_file and qc_file:
             if d[col].dtype == 'object':
                 d[col] = d[col].astype(str).str.strip()
 
-    # 2. MULTI-SITE SELECTION & AUTO-LOCALE DISCOVERY
+    # 2. MULTI-SITE SELECTION
     all_sites = sorted(df_m['Column-1:Site'].unique())
     selected_sites = st.sidebar.multiselect(
         "Select Sites:", 
@@ -63,14 +63,17 @@ if merc_file and qc_file:
         st.warning("Please select at least one site from the sidebar.")
         st.stop()
     
-    # Get all locales linked to ALL selected sites
     site_locales = df_m[df_m['Column-1:Site'].isin(selected_sites)]['Column-2:Locale'].unique()
     
     f_m_base = df_m[df_m['Column-1:Site'].isin(selected_sites)]
     f_q_base = df_q[df_q['locale'].isin(site_locales)]
 
-    # 3. STABLE GROWTH (Aggregated for selected sites)
+    # 3. STABLE GROWTH
     batch_cols = ['execution_batch_id', 'workflow_name', 'locale', 'Audit Creation Period Week']
+    # Adding demand_category to batch_cols if it exists to ensure grouping works in Tab 3
+    if 'demand_category' in f_q_base.columns:
+        batch_cols.append('demand_category')
+
     df_q_all_dedup = f_q_base.groupby(batch_cols).agg({'audit_created_units': 'first'}).reset_index()
 
     def get_stable_growth(data):
@@ -82,11 +85,12 @@ if merc_file and qc_file:
         return np.mean(diffs)
 
     stable_site_growth = get_stable_growth(df_q_all_dedup)
-    st.sidebar.metric(label=f"📈 Group Growth Rate", value=f"{stable_site_growth * 100:.2f}%")
+    st.sidebar.metric(label="📈 Group Growth Rate", value=f"{stable_site_growth * 100:.2f}%")
 
     # 4. PERFORMANCE & FILTERING
     f_m_base['Processed Units'] = pd.to_numeric(f_m_base['Processed Units'], errors='coerce').fillna(0)
     f_m_base['Processed Hours'] = pd.to_numeric(f_m_base['Processed Hours'], errors='coerce').fillna(0)
+    
     f_m_base['Calc_AHT'] = 3600 * (f_m_base['Processed Hours'] + 
                                    pd.to_numeric(f_m_base['Manual Skip Hours'], errors='coerce').fillna(0)) / \
                                    f_m_base['Processed Units'].replace(0, np.nan)
@@ -117,13 +121,13 @@ if merc_file and qc_file:
         except: return ''
 
     # --- TABS ---
-    tab1, tab2 = st.tabs(["📊 Historical Audit Data", "🚀 Future Forecast Explorer"])
+    tab1, tab2, tab3 = st.tabs(["📊 Historical Data", "🚀 Future Forecast", "📂 Category View"])
 
     with tab1:
         st.subheader(f"Historical Snapshot: {', '.join(selected_sites)}")
         st.markdown(f"<p class='date-header'>Snapshot Date: {today.strftime('%b %d, %Y')}</p>", unsafe_allow_html=True)
         
-        # Locale Table (Sampling % Removed)
+        # Locale Table
         loc_agg = qc_baseline.groupby('locale').agg({'audit_created_units':'sum', 'production_created_units':'sum'}).reset_index()
         loc_h = []
         for _, row in loc_agg.iterrows():
@@ -133,7 +137,7 @@ if merc_file and qc_file:
 
         st.divider()
 
-        # Workflow Table (Sampling % Removed)
+        # Workflow Table
         wf_agg = qc_baseline.groupby('workflow_name').agg({'audit_created_units':'sum', 'production_created_units':'sum'}).reset_index()
         wf_h = []
         for _, row in wf_agg.iterrows():
@@ -174,5 +178,29 @@ if merc_file and qc_file:
             st.dataframe(pd.DataFrame(wf_f).style.applymap(color_gap, subset=['Staffing Gap']), use_container_width=True, hide_index=True)
         else:
             st.warning("No active workflows match the current filters.")
+
+    with tab3:
+        st.subheader("📂 Demand Category Breakdown")
+        if 'demand_category' in qc_baseline.columns:
+            cat_agg = qc_baseline.groupby('demand_category').agg({'audit_created_units':'sum'}).reset_index()
+            cat_f = []
+            for _, row in cat_agg.iterrows():
+                # Get average AHT for all workflows in this category
+                cat_workflows = f_q[f_q['demand_category'] == row['demand_category']]['workflow_name'].unique()
+                avg_cat_aht = f_m[f_m['Column-4:Transformation Type'].isin(cat_workflows)]['Calc_AHT'].mean()
+                
+                pred = (row['audit_created_units']/num_weeks) * (1 + (stable_site_growth * week_idx))
+                hc = (pred * avg_cat_aht) / (3600 * prod_hours * 5)
+                
+                cat_f.append({
+                    "Category": row['demand_category'], 
+                    "Expected Units": int(pred), 
+                    "HC Needed": f"{hc:.2f}", 
+                    "Staffing Gap": f"{qas_per_site - hc:.2f}"
+                })
+            st.dataframe(pd.DataFrame(cat_f).style.applymap(color_gap, subset=['Staffing Gap']), use_container_width=True, hide_index=True)
+        else:
+            st.info("The 'demand_category' column was not found in the Quality Central file.")
+
 else:
     st.info("Upload files to generate the capacity plan across multiple sites.")
