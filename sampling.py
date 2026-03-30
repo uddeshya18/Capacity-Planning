@@ -102,7 +102,7 @@ if merc_file and qc_file:
     f_q = f_q_base[f_q_base['workflow_name'].isin(real_workflows)] if hide_ghosts else f_q_base
     f_m = f_m_base[f_m_base['Column-4:Transformation Type'].isin(real_workflows)] if hide_ghosts else f_m_base
 
-    # 4. BASELINE DATA
+    # 4. DATA AGGREGATION
     df_q_final_dedup = f_q.groupby(batch_cols).agg({'audit_created_units': 'first'}).reset_index()
     num_weeks = 4
     all_weeks = sorted(df_q['Audit Creation Period Week'].unique(), reverse=True)
@@ -114,12 +114,11 @@ if merc_file and qc_file:
         return clean[clean <= clean.quantile(0.95)].mean() if not clean.empty else 0
 
     # --- TABS ---
-    tab1, tab2, tab3 = st.tabs(["📊 Historical Data (Last 4 Weeks)", "🚀 Forecast Explorer", "📂 Category View"])
+    tab1, tab2, tab3 = st.tabs(["📊 Historical Data", "🚀 Forecast Explorer", "📂 Category View"])
 
     with tab1:
-        st.subheader("Historical Performance Snapshot")
+        st.subheader("Historical Performance Snapshot (Last 4 Weeks)")
         col_loc, col_wf = st.columns(2)
-        
         with col_loc:
             st.markdown("#### 📍 Locale Baseline")
             loc_agg = qc_baseline.groupby('locale').agg({'audit_created_units':'sum'}).reset_index()
@@ -128,7 +127,6 @@ if merc_file and qc_file:
                 aht = get_trimmed_aht(f_m[f_m['Column-2:Locale'] == row['locale']]['Calc_AHT'])
                 loc_h.append({"Locale": row['locale'], "Avg Weekly Vol": int(row['audit_created_units']/num_weeks), "AHT (s)": round(aht, 1)})
             st.dataframe(pd.DataFrame(loc_h), use_container_width=True, hide_index=True)
-
         with col_wf:
             st.markdown("#### 🛠️ Workflow Baseline")
             wf_agg = qc_baseline.groupby('workflow_name').agg({'audit_created_units':'sum'}).reset_index()
@@ -144,7 +142,6 @@ if merc_file and qc_file:
         selected_week_label = st.selectbox("Target Forecast Week:", week_labels)
         week_idx = week_labels.index(selected_week_label) + 1
 
-        # Forecast Tables
         st.markdown("#### 📍 Locale Prediction")
         loc_f = []
         for _, row in loc_agg.iterrows():
@@ -155,7 +152,6 @@ if merc_file and qc_file:
         st.dataframe(pd.DataFrame(loc_f).style.map(style_staffing_gap, subset=['Staffing Gap']), use_container_width=True, hide_index=True)
 
         st.divider()
-        
         st.markdown("#### 🛠️ Workflow Prediction")
         wf_f = []
         for _, row in wf_agg.iterrows():
@@ -174,24 +170,36 @@ if merc_file and qc_file:
             hier_data = hier_data[hier_data['demand_category'].isin(actual_categories)]
             hier_data['Tasks Remaining'] = ((hier_data['audit_created_units']/num_weeks) * (1 + (stable_site_growth * week_idx))).astype(int)
 
+            # --- COLOR BIFURCATION FIX ---
             fig = px.treemap(
                 hier_data,
-                path=['demand_category', 'workflow_name'],
+                path=[px.Constant("All Demand"), 'demand_category', 'workflow_name'],
                 values='Tasks Remaining',
-                color='demand_category',
-                title="Interactive Workload Bifurcation",
-                color_discrete_map={"Classic Alexa": "#2563eb", "Nova": "#dc2626", "Alexa+": "#059669", "Other": "#7c3aed"}
+                color='demand_category', # Forces colors to separate by Category
+                color_discrete_map={
+                    "Classic Alexa": "#1E40AF", # Dark Blue
+                    "Nova": "#B91C1C",          # Strong Red
+                    "Alexa+": "#047857",        # Dark Green
+                    "Other": "#6D28D9"           # Deep Purple
+                },
+                title="Interactive Demand Bifurcation"
             )
-            fig.update_traces(textinfo="label+value")
+            
+            # White borders make the 'workflows' inside a category visible as separate blocks
+            fig.update_traces(
+                textinfo="label+value",
+                marker=dict(line=dict(width=2, color='white'))
+            )
+            
             st.plotly_chart(fig, use_container_width=True)
 
-            st.markdown("#### 📋 Category & Workflow Breakdown")
+            st.markdown("#### 📋 Detailed Remaining Task Count")
             st.dataframe(
                 hier_data[['demand_category', 'workflow_name', 'Tasks Remaining']].sort_values(['demand_category', 'Tasks Remaining'], ascending=[True, False]),
                 use_container_width=True, hide_index=True
             )
         else:
-            st.info("No 'demand_category' detected in files.")
+            st.info("Ensure your QC file contains a 'demand_category' column.")
 
 else:
-    st.info("Upload Mercury (AHT) and QC (Volume) files to begin.")
+    st.info("Upload your Mercury and QC files to visualize the capacity plan.")
