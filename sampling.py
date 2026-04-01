@@ -43,6 +43,13 @@ def get_week_range(weeks_ahead):
     end = start + timedelta(days=4)
     return f"{start.strftime('%b %d')} - {end.strftime('%b %d, %Y')}"
 
+def get_sheet_name(weeks_ahead):
+    """Generates a clean, short date range for Excel sheet tabs (max 31 chars)"""
+    start = next_monday + timedelta(weeks=weeks_ahead-1)
+    end = start + timedelta(days=4)
+    # Format: "Oct 27-Oct 31"
+    return f"{start.strftime('%b %d')}-{end.strftime('%b %d')}"
+
 # --- STYLING HELPER ---
 def style_staffing_gap(v):
     try:
@@ -180,7 +187,6 @@ if merc_file and qc_file:
             if 'channel' in qc_baseline.columns:
                 agg_cols.insert(1, 'channel')
 
-            # Main data processing
             hier_data = qc_baseline.groupby(agg_cols).agg({'audit_created_units':'sum'}).reset_index()
             hier_data = hier_data[hier_data['demand_category'].isin(actual_categories)]
             
@@ -202,7 +208,6 @@ if merc_file and qc_file:
                 final_export.columns = [c.replace('workflow_name', 'workflow name') for c in final_export.columns]
                 return final_export
 
-            # UI Display for Selected Week
             current_view_df = get_predicted_df(week_idx_t3)
             
             tree_data = current_view_df.groupby(['demand_category', 'workflow name'])['expected units'].sum().reset_index()
@@ -219,21 +224,25 @@ if merc_file and qc_file:
             fig.update_traces(textinfo="label+value", marker=dict(line=dict(width=2, color='white')))
             st.plotly_chart(fig, use_container_width=True)
 
-            # Excel Download (Multiple Weeks)
+            # Excel Download with Date-Range Sheet Names
             output = io.BytesIO()
-            with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
-                for i in range(1, 5):
-                    sheet_name = f"Week_{i}_Forecast"
-                    week_data = get_predicted_df(i)
-                    week_data.to_excel(writer, index=False, sheet_name=sheet_name)
-            
-            st.markdown(f"#### 📋 Detailed Breakdown for {selected_week_t3}")
-            st.download_button(
-                label="📥 Download 4-Week Forecast (Excel)",
-                data=output.getvalue(),
-                file_name="capacity_forecast_4_weeks.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            )
+            try:
+                with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+                    for i in range(1, 5):
+                        sheet_name = get_sheet_name(i)
+                        week_data = get_predicted_df(i)
+                        week_data.to_excel(writer, index=False, sheet_name=sheet_name)
+                
+                st.markdown(f"#### 📋 Detailed Breakdown for {selected_week_t3}")
+                st.download_button(
+                    label="📥 Download 4-Week Forecast (Excel)",
+                    data=output.getvalue(),
+                    file_name=f"capacity_forecast_{today.strftime('%Y%m%d')}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                )
+            except Exception as e:
+                st.error(f"Excel Generation Error: {e}. Ensure 'xlsxwriter' is installed.")
+
             st.dataframe(current_view_df, use_container_width=True, hide_index=True)
         else:
             st.info("Demand Category column not detected.")
