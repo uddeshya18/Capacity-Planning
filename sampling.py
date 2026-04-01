@@ -78,6 +78,8 @@ if merc_file and qc_file:
     batch_cols = ['execution_batch_id', 'workflow_name', 'locale', 'Audit Creation Period Week']
     if 'demand_category' in f_q_base.columns:
         batch_cols.append('demand_category')
+    if 'channel' in f_q_base.columns:
+        batch_cols.append('channel')
 
     df_q_all_dedup = f_q_base.groupby(batch_cols).agg({'audit_created_units': 'first'}).reset_index()
 
@@ -147,8 +149,9 @@ if merc_file and qc_file:
         for _, row in loc_agg.iterrows():
             aht = get_trimmed_aht(f_m[f_m['Column-2:Locale'] == row['locale']]['Calc_AHT'])
             pred = (row['audit_created_units']/num_weeks) * (1 + (stable_site_growth * week_idx))
-            hc = (pred * aht) / (3600 * prod_hours * 5)
-            loc_f.append({"Locale": row['locale'], "Expected Units": int(pred), "HC Needed": round(hc, 2), "Staffing Gap": round(qas_per_site - hc, 2)})
+            audit_hrs = (pred * aht) / 3600
+            hc = audit_hrs / (prod_hours * 5)
+            loc_f.append({"Locale": row['locale'], "Expected Units": int(pred), "Expected Audit Hours": round(audit_hrs, 2), "Staffing Gap": round(qas_per_site - hc, 2)})
         st.dataframe(pd.DataFrame(loc_f).style.map(style_staffing_gap, subset=['Staffing Gap']), use_container_width=True, hide_index=True)
 
         st.divider()
@@ -157,14 +160,14 @@ if merc_file and qc_file:
         for _, row in wf_agg.iterrows():
             aht = get_trimmed_aht(f_m[f_m['Column-4:Transformation Type'] == row['workflow_name']]['Calc_AHT'])
             pred = (row['audit_created_units']/num_weeks) * (1 + (stable_site_growth * week_idx))
-            hc = (pred * aht) / (3600 * prod_hours * 5)
-            wf_f.append({"Workflow": row['workflow_name'], "Expected Units": int(pred), "HC Needed": round(hc, 2), "Staffing Gap": round(qas_per_site - hc, 2)})
+            audit_hrs = (pred * aht) / 3600
+            hc = audit_hrs / (prod_hours * 5)
+            wf_f.append({"Workflow": row['workflow_name'], "Expected Units": int(pred), "Expected Audit Hours": round(audit_hrs, 2), "Staffing Gap": round(qas_per_site - hc, 2)})
         st.dataframe(pd.DataFrame(wf_f).style.map(style_staffing_gap, subset=['Staffing Gap']), use_container_width=True, hide_index=True)
 
     with tab3:
         st.subheader("📂 Strategic Demand Overview")
         
-        # --- WEEK SELECTOR ADDED TO TAB 3 ---
         week_labels_t3 = [f"Week {i} ({get_week_range(i)})" for i in range(1, 5)]
         selected_week_t3 = st.selectbox("Select Forecast Week for Category View:", week_labels_t3, key="tab3_week")
         week_idx_t3 = week_labels_t3.index(selected_week_t3) + 1
@@ -172,38 +175,55 @@ if merc_file and qc_file:
         actual_categories = ["Classic Alexa", "Nova", "Alexa+", "Other"]
         
         if 'demand_category' in qc_baseline.columns:
-            hier_data = qc_baseline.groupby(['demand_category', 'workflow_name']).agg({'audit_created_units':'sum'}).reset_index()
+            # Grouping for specific output columns
+            agg_cols = ['demand_category', 'workflow_name', 'locale']
+            if 'channel' in qc_baseline.columns:
+                agg_cols.insert(1, 'channel')
+
+            hier_data = qc_baseline.groupby(agg_cols).agg({'audit_created_units':'sum'}).reset_index()
             hier_data = hier_data[hier_data['demand_category'].isin(actual_categories)]
             
-            # Recalculate 'Tasks Remaining' based on Tab 3's week selection
-            hier_data['Tasks Remaining'] = ((hier_data['audit_created_units']/num_weeks) * (1 + (stable_site_growth * week_idx_t3))).astype(int)
+            # Prediction Logic for Export Data
+            def calc_row_metrics(row):
+                aht = get_trimmed_aht(f_m[f_m['Column-4:Transformation Type'] == row['workflow_name']]['Calc_AHT'])
+                units = (row['audit_created_units']/num_weeks) * (1 + (stable_site_growth * week_idx_t3))
+                audit_hrs = (units * aht) / 3600
+                return pd.Series([int(units), round(audit_hrs, 2), round(aht, 1)])
 
+            hier_data[['expected units', 'expected audit hours', 'audit aht']] = hier_data.apply(calc_row_metrics, axis=1)
+
+            # Treemap Visualization (Aggregated by Category)
+            tree_data = hier_data.groupby(['demand_category', 'workflow_name'])['expected units'].sum().reset_index()
             fig = px.treemap(
-                hier_data,
+                tree_data,
                 path=[px.Constant("All Demand"), 'demand_category', 'workflow_name'],
-                values='Tasks Remaining',
+                values='expected units',
                 color='demand_category',
                 color_discrete_map={
-                    "Classic Alexa": "#1E40AF", 
-                    "Nova": "#B91C1C",          
-                    "Alexa+": "#047857",        
-                    "Other": "#6D28D9"           
+                    "Classic Alexa": "#1E40AF", "Nova": "#B91C1C", "Alexa+": "#047857", "Other": "#6D28D9"
                 },
                 title=f"Demand Bifurcation for {selected_week_t3}"
             )
-            
-            fig.update_traces(
-                textinfo="label+value",
-                marker=dict(line=dict(width=2, color='white'))
-            )
-            
+            fig.update_traces(textinfo="label+value", marker=dict(line=dict(width=2, color='white')))
             st.plotly_chart(fig, use_container_width=True)
 
+            # CSV Download Button
+            csv_cols = ['demand_category', 'workflow_name', 'locale', 'expected units', 'expected audit hours', 'audit aht']
+            if 'channel' in hier_data.columns:
+                csv_cols.insert(1, 'channel')
+            
+            export_df = hier_data[csv_cols].copy()
+            # Rename columns to match request exactly
+            export_df.columns = [c.replace('workflow_name', 'workflow name') for c in export_df.columns]
+            
             st.markdown(f"#### 📋 Detailed Breakdown for {selected_week_t3}")
-            st.dataframe(
-                hier_data[['demand_category', 'workflow_name', 'Tasks Remaining']].sort_values(['demand_category', 'Tasks Remaining'], ascending=[True, False]),
-                use_container_width=True, hide_index=True
+            st.download_button(
+                label="📥 Download Predicted Data (CSV)",
+                data=export_df.to_csv(index=False),
+                file_name=f"capacity_forecast_{selected_week_t3.replace(' ', '_')}.csv",
+                mime="text/csv",
             )
+            st.dataframe(export_df, use_container_width=True, hide_index=True)
         else:
             st.info("Demand Category column not detected.")
 
