@@ -3,6 +3,7 @@ import pandas as pd
 import numpy as np
 import plotly.express as px
 from datetime import datetime, timedelta
+import io
 
 # --- PAGE CONFIG ---
 st.set_page_config(page_title="Strategic Capacity Planner", layout="wide")
@@ -175,28 +176,39 @@ if merc_file and qc_file:
         actual_categories = ["Classic Alexa", "Nova", "Alexa+", "Other"]
         
         if 'demand_category' in qc_baseline.columns:
-            # Grouping for specific output columns
             agg_cols = ['demand_category', 'workflow_name', 'locale']
             if 'channel' in qc_baseline.columns:
                 agg_cols.insert(1, 'channel')
 
+            # Main data processing
             hier_data = qc_baseline.groupby(agg_cols).agg({'audit_created_units':'sum'}).reset_index()
             hier_data = hier_data[hier_data['demand_category'].isin(actual_categories)]
             
-            # Prediction Logic for Export Data
-            def calc_row_metrics(row):
-                aht = get_trimmed_aht(f_m[f_m['Column-4:Transformation Type'] == row['workflow_name']]['Calc_AHT'])
-                units = (row['audit_created_units']/num_weeks) * (1 + (stable_site_growth * week_idx_t3))
-                audit_hrs = (units * aht) / 3600
-                return pd.Series([int(units), round(audit_hrs, 2), round(aht, 1)])
+            def get_predicted_df(w_idx):
+                temp_df = hier_data.copy()
+                def calc_row_metrics(row):
+                    aht = get_trimmed_aht(f_m[f_m['Column-4:Transformation Type'] == row['workflow_name']]['Calc_AHT'])
+                    units = (row['audit_created_units']/num_weeks) * (1 + (stable_site_growth * w_idx))
+                    audit_hrs = (units * aht) / 3600
+                    return pd.Series([int(units), round(audit_hrs, 2), round(aht, 1)])
+                
+                temp_df[['expected units', 'expected audit hours', 'audit aht']] = temp_df.apply(calc_row_metrics, axis=1)
+                
+                cols_to_export = ['demand_category', 'workflow_name', 'locale', 'expected units', 'expected audit hours', 'audit aht']
+                if 'channel' in temp_df.columns:
+                    cols_to_export.insert(1, 'channel')
+                
+                final_export = temp_df[cols_to_export].copy()
+                final_export.columns = [c.replace('workflow_name', 'workflow name') for c in final_export.columns]
+                return final_export
 
-            hier_data[['expected units', 'expected audit hours', 'audit aht']] = hier_data.apply(calc_row_metrics, axis=1)
-
-            # Treemap Visualization (Aggregated by Category)
-            tree_data = hier_data.groupby(['demand_category', 'workflow_name'])['expected units'].sum().reset_index()
+            # UI Display for Selected Week
+            current_view_df = get_predicted_df(week_idx_t3)
+            
+            tree_data = current_view_df.groupby(['demand_category', 'workflow name'])['expected units'].sum().reset_index()
             fig = px.treemap(
                 tree_data,
-                path=[px.Constant("All Demand"), 'demand_category', 'workflow_name'],
+                path=[px.Constant("All Demand"), 'demand_category', 'workflow name'],
                 values='expected units',
                 color='demand_category',
                 color_discrete_map={
@@ -207,23 +219,22 @@ if merc_file and qc_file:
             fig.update_traces(textinfo="label+value", marker=dict(line=dict(width=2, color='white')))
             st.plotly_chart(fig, use_container_width=True)
 
-            # CSV Download Button
-            csv_cols = ['demand_category', 'workflow_name', 'locale', 'expected units', 'expected audit hours', 'audit aht']
-            if 'channel' in hier_data.columns:
-                csv_cols.insert(1, 'channel')
-            
-            export_df = hier_data[csv_cols].copy()
-            # Rename columns to match request exactly
-            export_df.columns = [c.replace('workflow_name', 'workflow name') for c in export_df.columns]
+            # Excel Download (Multiple Weeks)
+            output = io.BytesIO()
+            with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+                for i in range(1, 5):
+                    sheet_name = f"Week_{i}_Forecast"
+                    week_data = get_predicted_df(i)
+                    week_data.to_excel(writer, index=False, sheet_name=sheet_name)
             
             st.markdown(f"#### 📋 Detailed Breakdown for {selected_week_t3}")
             st.download_button(
-                label="📥 Download Predicted Data (CSV)",
-                data=export_df.to_csv(index=False),
-                file_name=f"capacity_forecast_{selected_week_t3.replace(' ', '_')}.csv",
-                mime="text/csv",
+                label="📥 Download 4-Week Forecast (Excel)",
+                data=output.getvalue(),
+                file_name="capacity_forecast_4_weeks.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             )
-            st.dataframe(export_df, use_container_width=True, hide_index=True)
+            st.dataframe(current_view_df, use_container_width=True, hide_index=True)
         else:
             st.info("Demand Category column not detected.")
 
