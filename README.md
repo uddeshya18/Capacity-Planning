@@ -1,12 +1,3 @@
----
-
-## 📦 Part of the Operations Excellence Suite
-This repository is an independent component of a modular, three-tier ecosystem designed to handle end-to-end workforce optimization and capacity logistics:
-
-1. **🌐 [Global Load Balancer](https://github.com/uddeshya18/ops-global-load-balancer):** Manages multi-site resource routing...
-2. **🧮 [Workforce Capacity Engine](https://github.com/uddeshya18/workforce-capacity-engine):** Handles granular headcount...
-3. **📈 [Demand Forecast Simulator (This Tool)](#):** Executes 4-week projections...
----
 
 # Capacity-Planning
 # 📊 Strategic Capacity Planner
